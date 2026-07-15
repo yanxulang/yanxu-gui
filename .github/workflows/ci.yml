@@ -65,7 +65,7 @@ jobs:
         with:
           repository: YanXuLang/yanxu
           path: yanxu-core
-          ref: ${{ github.event_name == 'pull_request' && 'codex/yanxu-1-1-7-gui' || 'main' }}
+          ref: main
       - name: 类型检查示例并验证 API 制品无漂移
         shell: bash
         run: |
