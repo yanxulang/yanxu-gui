@@ -4,3 +4,4 @@
 /言序.toml
 **/.yanxu/
 /build/
+/vendor/wayland-scanner/Cargo.lock

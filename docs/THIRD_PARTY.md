@@ -15,10 +15,11 @@
 ## Wayland 安全补丁来源
 
 crates.io 上的 `wayland-scanner 0.31.10` 依赖存在安全公告的
-`quick-xml 0.39`。工作区将同版本包固定到 Smithay 官方 `wayland-rs` 提交
-`249f35c8ce18c8a8000c627ffe04ac235bc0764f`；该提交改用
-`quick-xml 0.41`，许可仍为 MIT。固定完整提交号保证构建可复现，也避免跟随浮动
-分支。上游来源与固定值同时记录在根 `Cargo.toml` 和 `Cargo.lock` 中。
+`quick-xml 0.39`。`vendor/wayland-scanner` 保留该正式版本的公开源码与 MIT 许可，
+仅将 XML 依赖升级到修复 RUSTSEC-2026-0194、RUSTSEC-2026-0195 的
+`quick-xml 0.41`，并采用上游对应的 `xml10_content` API 调整。其余 Wayland
+依赖继续使用相互兼容的正式版本；补丁路径和最终依赖均记录在根 `Cargo.toml` 与
+`Cargo.lock` 中。
 
 ## 发布核对
 
