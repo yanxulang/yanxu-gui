@@ -15,4 +15,10 @@ rust-version = "1.92"
 # crates generates incompatible protocol bindings on Linux.
 wayland-backend = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
 wayland-client = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-cursor = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-protocols = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-protocols-misc = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-protocols-plasma = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-protocols-wlr = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
 wayland-scanner = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-sys = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
