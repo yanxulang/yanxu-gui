@@ -1,0 +1,16 @@
+[workspace]
+members = ["native"]
+exclude = ["vendor/wayland-scanner"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92"
+
+[patch.crates-io]
+# wayland-scanner 0.31.10 on crates.io still pins vulnerable quick-xml 0.39.
+# Use the released scanner source with only quick-xml upgraded, so generated
+# bindings remain compatible with the released Wayland client ecosystem.
+wayland-scanner = { path = "vendor/wayland-scanner" }

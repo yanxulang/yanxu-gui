@@ -1,0 +1,20 @@
+[package]
+name = "yanxu-gui-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Official Yanxu ABI v2 desktop GUI backend"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+arboard = { version = "3.6.1", default-features = false }
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", "wayland"] }
+sha2 = "0.10.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rfd = { version = "0.17.2", default-features = false, features = ["common-controls-v6"] }
