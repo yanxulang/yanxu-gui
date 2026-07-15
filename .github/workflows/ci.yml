@@ -96,7 +96,30 @@ jobs:
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             nm -gU "$ARTIFACT" | grep -F yanxu_native_module_v2
           elif [[ "$RUNNER_OS" == "Windows" ]]; then
-            dumpbin //exports "$ARTIFACT" | grep -F yanxu_native_module_v2
+            vswhere=""
+            for candidate in \
+              "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" \
+              "/c/Program Files/Microsoft Visual Studio/Installer/vswhere.exe"; do
+              if [[ -x "$candidate" ]]; then
+                vswhere="$candidate"
+                break
+              fi
+            done
+            test -n "$vswhere"
+            patterns=('VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe')
+            if [[ "$RUNNER_ARCH" == "ARM64" ]]; then
+              patterns=('VC\Tools\MSVC\**\bin\Hostarm64\arm64\dumpbin.exe' "${patterns[@]}")
+            fi
+            dumpbin=""
+            for pattern in "${patterns[@]}"; do
+              dumpbin_windows="$("$vswhere" -latest -products '*' -find "$pattern" | tr -d '\r' | head -n 1)"
+              if [[ -n "$dumpbin_windows" ]]; then
+                dumpbin="$(cygpath -u "$dumpbin_windows")"
+                break
+              fi
+            done
+            test -x "$dumpbin"
+            "$dumpbin" //exports "$ARTIFACT" | grep -F yanxu_native_module_v2
           else
             nm -D "$ARTIFACT" | grep -F yanxu_native_module_v2
           fi
