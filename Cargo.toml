@@ -10,5 +10,9 @@ rust-version = "1.92"
 
 [patch.crates-io]
 # wayland-scanner 0.31.10 on crates.io still pins vulnerable quick-xml 0.39.
-# This exact upstream revision retains the 0.31.10 API and uses quick-xml 0.41.
+# Keep the code generator and its tightly coupled runtime crates on one exact
+# upstream revision; mixing the patched scanner with released client/backend
+# crates generates incompatible protocol bindings on Linux.
+wayland-backend = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
+wayland-client = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }
 wayland-scanner = { git = "https://github.com/Smithay/wayland-rs", rev = "249f35c8ce18c8a8000c627ffe04ac235bc0764f" }

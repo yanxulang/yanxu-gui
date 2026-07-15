@@ -1,19 +1,19 @@
 lock_version = 2
-manifest_checksum = "c491b463d5ac77c01ddc21820d542300159e6d276a423e3dcaa3e0b7866a5f95"
+manifest_checksum = "0e25b3f6bfd63cc34fecdf61c1b0cd4a564060ab78bdba1ea258dd5ad4a3fcd8"
 target = "aarch64-apple-darwin"
 generator = "1.1.7"
 
 [root_dependencies]
-"言窗" = "yanxu-gui@0.1.0#a5b4b144f221-583944353268f224"
+"言窗" = "yanxu-gui@0.1.0#a5b4b144f221-6b469626f49f5e88"
 
 [root_dev_dependencies]
 
 [[package]]
-id = "yanxu-gui@0.1.0#a5b4b144f221-583944353268f224"
+id = "yanxu-gui@0.1.0#a5b4b144f221-6b469626f49f5e88"
 name = "yanxu-gui"
 version = "0.1.0"
 source = "path:.."
-checksum = "583944353268f224ee9c0d2de11c2518263dc74f6aa6040e810641171201a030"
+checksum = "6b469626f49f5e887cf2aa2d6103fc531daa954be02e17962c9bb6e46d282c59"
 entry = "src/主.yx"
 target = "aarch64-apple-darwin"
 minimum_yanxu = ">=1.1.7"
