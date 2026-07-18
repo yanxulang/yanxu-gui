@@ -1,6 +1,6 @@
 # 言窗（yanxu-gui）
 
-言窗是言序 1.1.7 的官方桌面 GUI 包。公开层使用中文言序 API，原生层通过
+言窗是言序 1.1.12 的官方桌面 GUI 包。公开层使用中文言序 API，原生层通过
 ABI v2 封装 `eframe/egui + winit`，支持 Windows、macOS、Linux Wayland 与
 Linux X11。公开回调使用类型化`事件`对象，不把原生框架类型泄露给应用。
 
