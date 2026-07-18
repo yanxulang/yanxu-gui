@@ -214,6 +214,7 @@ pub enum CanvasCommand {
         minimum: [f32; 2],
         maximum: [f32; 2],
         bytes: Vec<u8>,
+        decoded_bytes: usize,
     },
     Clip {
         minimum: [f32; 2],
@@ -223,6 +224,22 @@ pub enum CanvasCommand {
         translation: [f32; 2],
         scale: [f32; 2],
     },
+}
+
+impl CanvasCommand {
+    pub fn memory_cost(&self) -> usize {
+        const COMMAND_OVERHEAD: usize = 128;
+        let payload = match self {
+            Self::Text { text, .. } => text.len(),
+            Self::Image {
+                bytes,
+                decoded_bytes,
+                ..
+            } => bytes.len().saturating_add(*decoded_bytes),
+            _ => 0,
+        };
+        COMMAND_OVERHEAD.saturating_add(payload)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +278,7 @@ pub enum ControlKind {
     },
     Canvas {
         commands: Vec<CanvasCommand>,
+        memory_bytes: usize,
     },
 }
 

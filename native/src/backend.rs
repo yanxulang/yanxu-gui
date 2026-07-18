@@ -3,8 +3,9 @@ use crate::bridge::{encode_data, free_value};
 use crate::model::*;
 use eframe::egui;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,10 @@ const TYPE_WINDOW: &[u8] = b"yanxu.gui.window";
 const TYPE_LAYOUT: &[u8] = b"yanxu.gui.layout";
 const TYPE_CONTROL: &[u8] = b"yanxu.gui.control";
 const TYPE_TIMER: &[u8] = b"yanxu.gui.timer";
+const MAX_CANVAS_COMMANDS: usize = 16_384;
+const MAX_CANVAS_MEMORY: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 4_096;
+const MAX_IMAGE_DECODE_ALLOC: u64 = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct HostApi(pub NativeHost);
@@ -474,16 +479,14 @@ pub unsafe fn call(
             let NodeKind::Control(control) = &mut model.node_mut(resource.id)?.kind else {
                 return Err("GUI_RESOURCE_TYPE");
             };
-            let ControlKind::Canvas { commands } = &mut control.kind else {
+            let ControlKind::Canvas {
+                commands,
+                memory_bytes,
+            } = &mut control.kind
+            else {
                 return Err("GUI_CONTROL_TYPE");
             };
-            if matches!(command, CanvasCommand::Clear(_)) {
-                commands.clear();
-            }
-            if commands.len() >= 65_536 {
-                return Err("GUI_CANVAS_LIMIT");
-            }
-            commands.push(command);
+            append_canvas_command(commands, memory_bytes, command)?;
             Ok(Output::Value(Data::Nil))
         }
         Operation::EmitCustom => {
@@ -689,7 +692,7 @@ fn apply_window_config(
     match config.get("图标") {
         None | Some(Data::Nil) => {}
         Some(Data::Bytes(icon)) => {
-            image::load_from_memory(icon).map_err(|_| "GUI_IMAGE")?;
+            decode_image(icon)?;
             window.icon = Some(icon.clone());
         }
         _ => return Err("GUI_VALUE_TYPE"),
@@ -775,7 +778,10 @@ fn create_control(
         "图片" => ControlKind::Image {
             bytes: match config.get("图片") {
                 None | Some(Data::Nil) => Vec::new(),
-                Some(Data::Bytes(bytes)) => bytes.clone(),
+                Some(Data::Bytes(bytes)) => {
+                    decode_image(bytes)?;
+                    bytes.clone()
+                }
                 _ => return Err("GUI_VALUE_TYPE"),
             },
             preserve_ratio: map_bool(config, "保持比例")?.unwrap_or(true),
@@ -792,6 +798,7 @@ fn create_control(
         },
         "Canvas" | "画布" => ControlKind::Canvas {
             commands: Vec::new(),
+            memory_bytes: 0,
         },
         _ => return Err("GUI_CONTROL_TYPE"),
     };
@@ -871,7 +878,7 @@ fn set_property(
                     let Data::Bytes(bytes) = value else {
                         return Err("GUI_VALUE_TYPE");
                     };
-                    image::load_from_memory(bytes).map_err(|_| "GUI_IMAGE")?;
+                    decode_image(bytes)?;
                     window.icon = Some(bytes.clone());
                 }
                 _ => return Err("GUI_PROPERTY"),
@@ -920,7 +927,7 @@ fn set_control_property(
             let Data::Bytes(bytes) = value else {
                 return Err("GUI_VALUE_TYPE");
             };
-            image::load_from_memory(bytes).map_err(|_| "GUI_IMAGE")?;
+            decode_image(bytes)?;
             let ControlKind::Image { bytes: current, .. } = &mut control.kind else {
                 return Err("GUI_CONTROL_TYPE");
             };
@@ -1024,7 +1031,7 @@ fn color(value: &Data) -> Result<[u8; 4], &'static str> {
             for (index, value) in values.iter().enumerate() {
                 color[index] = value
                     .as_f64()
-                    .filter(|value| (0.0..=255.0).contains(value))
+                    .filter(|value| value.fract() == 0.0 && (0.0..=255.0).contains(value))
                     .ok_or("GUI_COLOR")? as u8;
             }
             Ok(color)
@@ -1044,6 +1051,51 @@ fn parse_hex_color(value: &str) -> Result<[u8; 4], &'static str> {
             .map_err(|_| "GUI_COLOR")?;
     }
     Ok(color)
+}
+
+fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage, &'static str> {
+    if bytes.is_empty() {
+        return Err("GUI_IMAGE");
+    }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "GUI_IMAGE")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
+    reader.limits(limits);
+    reader.decode().map_err(|_| "GUI_IMAGE")
+}
+
+fn decoded_image_bytes(image: &image::DynamicImage) -> Result<usize, &'static str> {
+    usize::try_from(
+        u64::from(image.width())
+            .checked_mul(u64::from(image.height()))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("GUI_IMAGE")?,
+    )
+    .map_err(|_| "GUI_IMAGE")
+}
+
+fn append_canvas_command(
+    commands: &mut Vec<CanvasCommand>,
+    memory_bytes: &mut usize,
+    command: CanvasCommand,
+) -> Result<(), &'static str> {
+    if matches!(command, CanvasCommand::Clear(_)) {
+        commands.clear();
+        *memory_bytes = 0;
+    }
+    let next_memory = memory_bytes
+        .checked_add(command.memory_cost())
+        .ok_or("GUI_CANVAS_LIMIT")?;
+    if commands.len() >= MAX_CANVAS_COMMANDS || next_memory > MAX_CANVAS_MEMORY {
+        return Err("GUI_CANVAS_LIMIT");
+    }
+    commands.push(command);
+    *memory_bytes = next_memory;
+    Ok(())
 }
 
 fn dialog(kind: &str, config: &BTreeMap<String, Data>) -> Result<Data, &'static str> {
@@ -1091,6 +1143,29 @@ fn path_data(path: std::path::PathBuf) -> Data {
     Data::String(path.to_string_lossy().into_owned())
 }
 
+fn canvas_value(value: &Data, minimum: f64, maximum: f64) -> Result<f32, &'static str> {
+    value
+        .as_f64()
+        .filter(|value| (minimum..=maximum).contains(value))
+        .map(|value| value as f32)
+        .ok_or("GUI_CANVAS_COMMAND")
+}
+
+fn canvas_number(
+    map: &BTreeMap<String, Data>,
+    key: &str,
+    default: Option<f64>,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f32, &'static str> {
+    let value = map_number(map, key)?
+        .or(default)
+        .ok_or("GUI_CANVAS_COMMAND")?;
+    ((minimum..=maximum).contains(&value))
+        .then_some(value as f32)
+        .ok_or("GUI_CANVAS_COMMAND")
+}
+
 fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'static str> {
     let kind = map_text(map, "类型")?.ok_or("GUI_CANVAS_COMMAND")?;
     let point = |name: &str| -> Result<[f32; 2], &'static str> {
@@ -1101,8 +1176,8 @@ fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'stati
             return Err("GUI_CANVAS_COMMAND");
         }
         Ok([
-            values[0].as_f64().ok_or("GUI_CANVAS_COMMAND")? as f32,
-            values[1].as_f64().ok_or("GUI_CANVAS_COMMAND")? as f32,
+            canvas_value(&values[0], -1_000_000.0, 1_000_000.0)?,
+            canvas_value(&values[1], -1_000_000.0, 1_000_000.0)?,
         ])
     };
     let rgba = |name: &str, fallback: [u8; 4]| -> Result<[u8; 4], &'static str> {
@@ -1117,45 +1192,58 @@ fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'stati
             from: point("起点")?,
             to: point("终点")?,
             color: rgba("颜色", [255, 255, 255, 255])?,
-            width: map_number(map, "宽度")?.unwrap_or(1.0).clamp(0.1, 256.0) as f32,
+            width: canvas_number(map, "宽度", Some(1.0), 0.1, 256.0)?,
         }),
         "矩形" => Ok(CanvasCommand::Rectangle {
             minimum: point("起点")?,
             maximum: point("终点")?,
             color: rgba("颜色", [0, 0, 0, 0])?,
             stroke: rgba("边框颜色", [255, 255, 255, 255])?,
-            stroke_width: map_number(map, "边框宽度")?.unwrap_or(1.0) as f32,
-            radius: map_number(map, "圆角")?.unwrap_or(0.0) as f32,
+            stroke_width: canvas_number(map, "边框宽度", Some(1.0), 0.0, 256.0)?,
+            radius: canvas_number(map, "圆角", Some(0.0), 0.0, 4_096.0)?,
         }),
         "圆" => Ok(CanvasCommand::Circle {
             center: point("圆心")?,
-            radius: map_number(map, "半径")?.ok_or("GUI_CANVAS_COMMAND")? as f32,
+            radius: canvas_number(map, "半径", None, 0.0, 1_000_000.0)?,
             color: rgba("颜色", [0, 0, 0, 0])?,
             stroke: rgba("边框颜色", [255, 255, 255, 255])?,
-            stroke_width: map_number(map, "边框宽度")?.unwrap_or(1.0) as f32,
+            stroke_width: canvas_number(map, "边框宽度", Some(1.0), 0.0, 256.0)?,
         }),
         "文字" => Ok(CanvasCommand::Text {
             position: point("位置")?,
             text: map_text(map, "文字")?.ok_or("GUI_CANVAS_COMMAND")?,
             color: rgba("颜色", [255, 255, 255, 255])?,
-            size: map_number(map, "字号")?.unwrap_or(14.0) as f32,
+            size: canvas_number(map, "字号", Some(14.0), 1.0, 1_024.0)?,
         }),
-        "图片" => Ok(CanvasCommand::Image {
-            minimum: point("起点")?,
-            maximum: point("终点")?,
-            bytes: match map.get("图片") {
-                Some(Data::Bytes(bytes)) => bytes.clone(),
-                _ => return Err("GUI_CANVAS_COMMAND"),
-            },
-        }),
+        "图片" => {
+            let Some(Data::Bytes(bytes)) = map.get("图片") else {
+                return Err("GUI_CANVAS_COMMAND");
+            };
+            let image = decode_image(bytes)?;
+            Ok(CanvasCommand::Image {
+                minimum: point("起点")?,
+                maximum: point("终点")?,
+                bytes: bytes.clone(),
+                decoded_bytes: decoded_image_bytes(&image)?,
+            })
+        }
         "裁剪" => Ok(CanvasCommand::Clip {
             minimum: point("起点")?,
             maximum: point("终点")?,
         }),
-        "变换" => Ok(CanvasCommand::Transform {
-            translation: point("平移")?,
-            scale: point("缩放")?,
-        }),
+        "变换" => {
+            let scale = point("缩放")?;
+            if scale
+                .iter()
+                .any(|value| !(0.001..=1_000.0).contains(&value.abs()))
+            {
+                return Err("GUI_CANVAS_COMMAND");
+            }
+            Ok(CanvasCommand::Transform {
+                translation: point("平移")?,
+                scale,
+            })
+        }
         _ => Err("GUI_CANVAS_COMMAND"),
     }
 }
@@ -1197,6 +1285,7 @@ fn run(model: Arc<Mutex<Model>>, host: HostApi) -> Result<(), &'static str> {
                 host,
                 root_window: None,
                 textures: HashMap::new(),
+                active_textures: HashSet::new(),
                 pending: Vec::new(),
                 fonts_loaded: false,
             }))
@@ -1231,6 +1320,7 @@ struct DesktopApp {
     host: HostApi,
     root_window: Option<u64>,
     textures: HashMap<String, egui::TextureHandle>,
+    active_textures: HashSet<String>,
     pending: Vec<PendingEvent>,
     fonts_loaded: bool,
 }
@@ -1238,6 +1328,7 @@ struct DesktopApp {
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        self.active_textures.clear();
         if !self.fonts_loaded {
             self.install_system_fallback_fonts(&context);
             self.fonts_loaded = true;
@@ -1306,6 +1397,8 @@ impl eframe::App for DesktopApp {
                 self.render_children(ui, &mut model, window_id);
             });
         }
+        self.textures
+            .retain(|key, _| self.active_textures.contains(key));
         for (timer, callback) in model.due_timers(Instant::now()) {
             if let Ok(node) = model.node(timer) {
                 self.pending.push(PendingEvent {
@@ -1419,7 +1512,7 @@ impl DesktopApp {
             )));
         }
         if let Some(bytes) = &window.icon
-            && let Ok(image) = image::load_from_memory(bytes)
+            && let Ok(image) = decode_image(bytes)
         {
             let image = image.to_rgba8();
             let width = image.width();
@@ -1751,7 +1844,7 @@ impl DesktopApp {
                         })
                         .response
                     }
-                    ControlKind::Canvas { commands } => {
+                    ControlKind::Canvas { commands, .. } => {
                         self.render_canvas(ui, node.id, commands, width, height)
                     }
                 }
@@ -1842,9 +1935,12 @@ impl DesktopApp {
         preserve_ratio: bool,
     ) -> egui::Response {
         let key = format!("image-{id}-{:x}", Sha256::digest(bytes));
+        if !bytes.is_empty() {
+            self.active_textures.insert(key.clone());
+        }
         if !bytes.is_empty()
             && !self.textures.contains_key(&key)
-            && let Ok(image) = image::load_from_memory(bytes)
+            && let Ok(image) = decode_image(bytes)
         {
             let image = image.to_rgba8();
             let size = [image.width() as usize, image.height() as usize];
@@ -1948,10 +2044,12 @@ impl DesktopApp {
                     minimum,
                     maximum,
                     bytes,
+                    ..
                 } => {
                     let key = format!("canvas-{id}-{index}-{:x}", Sha256::digest(bytes));
+                    self.active_textures.insert(key.clone());
                     if !self.textures.contains_key(&key)
-                        && let Ok(image) = image::load_from_memory(bytes)
+                        && let Ok(image) = decode_image(bytes)
                     {
                         let image = image.to_rgba8();
                         let size = [image.width() as usize, image.height() as usize];
@@ -2572,5 +2670,82 @@ mod tests {
             canvas_command(&BTreeMap::from([("类型".into(), Data::Integer(1))])),
             Err("GUI_VALUE_TYPE")
         ));
+        assert_eq!(
+            color(&Data::Array(vec![
+                Data::Number(1.5),
+                Data::Integer(2),
+                Data::Integer(3),
+            ])),
+            Err("GUI_COLOR")
+        );
+        assert!(
+            canvas_command(&BTreeMap::from([
+                ("类型".into(), Data::String("线段".into())),
+                (
+                    "起点".into(),
+                    Data::Array(vec![Data::Number(1.0e20), Data::Integer(0)])
+                ),
+                (
+                    "终点".into(),
+                    Data::Array(vec![Data::Integer(1), Data::Integer(1)])
+                ),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn image_decoding_and_canvas_storage_have_hard_limits() {
+        use image::ImageEncoder;
+
+        let decoded = decode_image(include_bytes!("../../examples/assets/言序.png"))
+            .expect("bundled PNG is valid");
+        assert_eq!((decoded.width(), decoded.height()), (512, 512));
+
+        let width = MAX_IMAGE_DIMENSION + 1;
+        let mut oversized = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut oversized)
+            .write_image(
+                &vec![0_u8; width as usize * 4],
+                width,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode oversized fixture");
+        assert!(matches!(decode_image(&oversized), Err("GUI_IMAGE")));
+
+        let line = || CanvasCommand::Line {
+            from: [0.0, 0.0],
+            to: [1.0, 1.0],
+            color: [0, 0, 0, 255],
+            width: 1.0,
+        };
+        let mut commands = Vec::new();
+        let mut memory_bytes = 0;
+        for _ in 0..MAX_CANVAS_COMMANDS {
+            append_canvas_command(&mut commands, &mut memory_bytes, line())
+                .expect("command count within limit");
+        }
+        assert_eq!(
+            append_canvas_command(&mut commands, &mut memory_bytes, line()),
+            Err("GUI_CANVAS_LIMIT")
+        );
+        append_canvas_command(
+            &mut commands,
+            &mut memory_bytes,
+            CanvasCommand::Clear([0, 0, 0, 0]),
+        )
+        .expect("clear resets command budget");
+        assert_eq!(commands.len(), 1);
+
+        commands.clear();
+        memory_bytes = MAX_CANVAS_MEMORY - line().memory_cost();
+        append_canvas_command(&mut commands, &mut memory_bytes, line())
+            .expect("memory boundary is inclusive");
+        assert_eq!(memory_bytes, MAX_CANVAS_MEMORY);
+        assert_eq!(
+            append_canvas_command(&mut commands, &mut memory_bytes, line()),
+            Err("GUI_CANVAS_LIMIT")
+        );
     }
 }
