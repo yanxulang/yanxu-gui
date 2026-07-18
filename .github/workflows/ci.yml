@@ -128,6 +128,8 @@ jobs:
           path: .yanxu/toolchain
           ref: 0e66486b4723ba96ed0ee67a43f301a03da062d0 # yanxu 1.1.12
       - name: 构建并核对言序 1.1.12
+        env:
+          YANXU_BUILD_SHA: 0e66486b4723ba96ed0ee67a43f301a03da062d0
         shell: bash
         run: |
           set -euo pipefail
