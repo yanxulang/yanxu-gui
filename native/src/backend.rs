@@ -802,7 +802,12 @@ fn create_control(
         },
         _ => return Err("GUI_CONTROL_TYPE"),
     };
-    Ok(ControlState::new(kind))
+    let mut control = ControlState::new(kind);
+    if let ControlKind::Slider { minimum, .. } = &control.kind {
+        control.value = *minimum;
+    }
+    validate_control_state(&control)?;
+    Ok(control)
 }
 
 fn apply_control_config(
@@ -813,8 +818,9 @@ fn apply_control_config(
         .or(map_text(config, "内容")?)
         .unwrap_or_default();
     control.selected = map_bool(config, "选中")?.unwrap_or(false);
-    control.value = map_number(config, "值")?.unwrap_or(0.0);
-    control.selected_index = map_u32(config, "当前项")?.unwrap_or(0) as usize;
+    control.value = map_number(config, "值")?.unwrap_or(control.value);
+    control.selected_index =
+        map_u32(config, "当前项")?.unwrap_or(control.selected_index as u32) as usize;
     control.text_color = config.get("文字颜色").map(color).transpose()?;
     control.background_color = config.get("背景颜色").map(color).transpose()?;
     control.border_color = config.get("边框颜色").map(color).transpose()?;
@@ -835,7 +841,86 @@ fn apply_control_config(
     control.margin = map_number(config, "外边距")?
         .unwrap_or(0.0)
         .clamp(0.0, 512.0) as f32;
+    validate_control_state(control)
+}
+
+fn control_item_count(kind: &ControlKind) -> Option<usize> {
+    match kind {
+        ControlKind::Select { options } => Some(options.len()),
+        ControlKind::List { items } | ControlKind::Menu { items } => Some(items.len()),
+        ControlKind::Tabs { tabs } => Some(tabs.len()),
+        _ => None,
+    }
+}
+
+fn validate_control_state(control: &ControlState) -> Result<(), &'static str> {
+    validate_control_value(&control.kind, control.value)?;
+    validate_selected_index(&control.kind, control.selected_index)
+}
+
+fn validate_control_value(kind: &ControlKind, value: f64) -> Result<(), &'static str> {
+    match kind {
+        ControlKind::Slider { minimum, maximum }
+            if !(-1.0e12..=1.0e12).contains(minimum)
+                || !(-1.0e12..=1.0e12).contains(maximum)
+                || minimum >= maximum
+                || !(*minimum..=*maximum).contains(&value) =>
+        {
+            return Err("GUI_CONTROL_RANGE");
+        }
+        ControlKind::Progress if !(0.0..=1.0).contains(&value) => {
+            return Err("GUI_CONTROL_RANGE");
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+fn validate_selected_index(kind: &ControlKind, selected_index: usize) -> Result<(), &'static str> {
+    if let Some(count) = control_item_count(kind)
+        && ((count == 0 && selected_index != 0) || (count > 0 && selected_index >= count))
+    {
+        return Err("GUI_CONTROL_RANGE");
+    }
+    Ok(())
+}
+
+fn validate_common(common: &Common) -> Result<(), &'static str> {
+    for (value, minimum, maximum) in [
+        (common.width, common.minimum_width, common.maximum_width),
+        (common.height, common.minimum_height, common.maximum_height),
+    ] {
+        if minimum.zip(maximum).is_some_and(|(min, max)| min > max)
+            || value.zip(minimum).is_some_and(|(value, min)| value < min)
+            || value.zip(maximum).is_some_and(|(value, max)| value > max)
+        {
+            return Err("GUI_SIZE_RANGE");
+        }
+    }
+    Ok(())
+}
+
+fn set_common_property(common: &mut Common, key: &str, value: &Data) -> Result<bool, &'static str> {
+    let mut next = common.clone();
+    match key {
+        "可见" => next.visible = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+        "启用" => next.enabled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+        "宽" => next.width = optional_positive_f32(Some(value))?,
+        "高" => next.height = optional_positive_f32(Some(value))?,
+        "最小宽" => next.minimum_width = optional_positive_f32(Some(value))?,
+        "最小高" => next.minimum_height = optional_positive_f32(Some(value))?,
+        "最大宽" => next.maximum_width = optional_positive_f32(Some(value))?,
+        "最大高" => next.maximum_height = optional_positive_f32(Some(value))?,
+        "工具提示" => next.tooltip = text(value)?.into(),
+        "焦点" => next.focus_requested = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+        "样式类" => next.style_class = text(value)?.into(),
+        "可访问名称" => next.accessible_name = text(value)?.into(),
+        "可访问描述" => next.accessible_description = text(value)?.into(),
+        _ => return Ok(false),
+    }
+    validate_common(&next)?;
+    *common = next;
+    Ok(true)
 }
 
 fn set_property(
@@ -845,69 +930,55 @@ fn set_property(
 ) -> Result<Option<u64>, &'static str> {
     let mut model = lock_model(&resource.model)?;
     let node = model.node_mut(resource.id)?;
+    if set_common_property(&mut node.common, key, value)? {
+        return Ok(None);
+    }
     let mut callback_to_release = None;
-    match key {
-        "可见" => node.common.visible = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "启用" => node.common.enabled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "宽" => node.common.width = optional_positive_f32(Some(value))?,
-        "高" => node.common.height = optional_positive_f32(Some(value))?,
-        "最小宽" => node.common.minimum_width = optional_positive_f32(Some(value))?,
-        "最小高" => node.common.minimum_height = optional_positive_f32(Some(value))?,
-        "最大宽" => node.common.maximum_width = optional_positive_f32(Some(value))?,
-        "最大高" => node.common.maximum_height = optional_positive_f32(Some(value))?,
-        "工具提示" => node.common.tooltip = text(value)?.into(),
-        "焦点" => node.common.focus_requested = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "样式类" => node.common.style_class = text(value)?.into(),
-        "可访问名称" => node.common.accessible_name = text(value)?.into(),
-        "可访问描述" => node.common.accessible_description = text(value)?.into(),
-        _ => match &mut node.kind {
-            NodeKind::Application { title, theme } => match key {
-                "名称" => *title = text(value)?.into(),
-                "主题" => *theme = text(value)?.into(),
-                _ => return Err("GUI_PROPERTY"),
-            },
-            NodeKind::Window(window) => match key {
-                "标题" => window.title = text(value)?.into(),
-                "最大化" => window.maximized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "最小化" => window.minimized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "全屏" => window.fullscreen = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "置顶" => window.always_on_top = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "可缩放" => window.resizable = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "居中" => window.centered = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "图标" => {
-                    let Data::Bytes(bytes) = value else {
-                        return Err("GUI_VALUE_TYPE");
-                    };
-                    decode_image(bytes)?;
-                    window.icon = Some(bytes.clone());
+    match &mut node.kind {
+        NodeKind::Application { title, theme } => match key {
+            "名称" => *title = text(value)?.into(),
+            "主题" => *theme = text(value)?.into(),
+            _ => return Err("GUI_PROPERTY"),
+        },
+        NodeKind::Window(window) => match key {
+            "标题" => window.title = text(value)?.into(),
+            "最大化" => window.maximized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "最小化" => window.minimized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "全屏" => window.fullscreen = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "置顶" => window.always_on_top = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "可缩放" => window.resizable = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "居中" => window.centered = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "图标" => {
+                let Data::Bytes(bytes) = value else {
+                    return Err("GUI_VALUE_TYPE");
+                };
+                decode_image(bytes)?;
+                window.icon = Some(bytes.clone());
+            }
+            _ => return Err("GUI_PROPERTY"),
+        },
+        NodeKind::Layout(layout) => match key {
+            "间距" => {
+                layout.spacing = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
+            }
+            "内边距" => {
+                layout.padding = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
+            }
+            "伸缩" => {
+                layout.grow = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 1000.0) as f32
+            }
+            _ => return Err("GUI_PROPERTY"),
+        },
+        NodeKind::Control(control) => set_control_property(control, key, value)?,
+        NodeKind::Timer(timer) => match key {
+            "取消" => {
+                if !value.as_bool().ok_or("GUI_VALUE_TYPE")? {
+                    return Err("GUI_TIMER_STATE");
                 }
-                _ => return Err("GUI_PROPERTY"),
-            },
-            NodeKind::Layout(layout) => match key {
-                "间距" => {
-                    layout.spacing =
-                        value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
-                }
-                "内边距" => {
-                    layout.padding =
-                        value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
-                }
-                "伸缩" => {
-                    layout.grow = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 1000.0) as f32
-                }
-                _ => return Err("GUI_PROPERTY"),
-            },
-            NodeKind::Control(control) => set_control_property(control, key, value)?,
-            NodeKind::Timer(timer) => match key {
-                "取消" => {
-                    if !value.as_bool().ok_or("GUI_VALUE_TYPE")? {
-                        return Err("GUI_TIMER_STATE");
-                    }
-                    timer.cancelled = true;
-                    callback_to_release = timer.callback.take();
-                }
-                _ => return Err("GUI_PROPERTY"),
-            },
+                timer.cancelled = true;
+                callback_to_release = timer.callback.take();
+            }
+            _ => return Err("GUI_PROPERTY"),
         },
     }
     Ok(callback_to_release)
@@ -921,8 +992,16 @@ fn set_control_property(
     match key {
         "文字" | "内容" => control.text = text(value)?.into(),
         "选中" => control.selected = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "值" => control.value = value.as_f64().ok_or("GUI_VALUE_TYPE")?,
-        "当前项" => control.selected_index = value.as_u32().ok_or("GUI_VALUE_TYPE")? as usize,
+        "值" => {
+            let next = value.as_f64().ok_or("GUI_VALUE_TYPE")?;
+            validate_control_value(&control.kind, next)?;
+            control.value = next;
+        }
+        "当前项" => {
+            let next = value.as_u32().ok_or("GUI_VALUE_TYPE")? as usize;
+            validate_selected_index(&control.kind, next)?;
+            control.selected_index = next;
+        }
         "图片" => {
             let Data::Bytes(bytes) = value else {
                 return Err("GUI_VALUE_TYPE");
@@ -1705,8 +1784,7 @@ impl DesktopApp {
         if control.margin > 0.0 {
             ui.add_space(control.margin);
         }
-        let width = node.common.width.unwrap_or_else(|| ui.available_width());
-        let height = node.common.height.unwrap_or(24.0);
+        let [width, height] = resolved_control_size(&node.common, ui.available_width());
         let response = ui
             .add_enabled_ui(node.common.enabled, |ui| {
                 ui.style_mut().override_font_id = Some(egui::FontId::new(
@@ -2201,6 +2279,23 @@ fn prepare_window_close(model: &mut Model, id: u64) -> (Option<PendingEvent>, Ve
         );
     }
     (None, model.remove(id))
+}
+
+fn resolved_control_size(common: &Common, available_width: f32) -> [f32; 2] {
+    let minimum_width = common.minimum_width.unwrap_or(1.0);
+    let maximum_width = common.maximum_width.unwrap_or(16_384.0);
+    let minimum_height = common.minimum_height.unwrap_or(1.0);
+    let maximum_height = common.maximum_height.unwrap_or(16_384.0);
+    [
+        common
+            .width
+            .unwrap_or(available_width.max(1.0))
+            .clamp(minimum_width, maximum_width),
+        common
+            .height
+            .unwrap_or(24.0)
+            .clamp(minimum_height, maximum_height),
+    ]
 }
 
 fn pointer_event(context: &egui::Context) -> Option<Data> {
@@ -2813,5 +2908,67 @@ mod tests {
             append_canvas_command(&mut commands, &mut memory_bytes, line()),
             Err("GUI_CANVAS_LIMIT")
         );
+    }
+
+    #[test]
+    fn control_ranges_and_size_constraints_are_enforced_before_commit() {
+        assert!(matches!(
+            create_control(
+                "滑块",
+                &BTreeMap::from([
+                    ("最小值".into(), Data::Integer(10)),
+                    ("最大值".into(), Data::Integer(5)),
+                ])
+            ),
+            Err("GUI_CONTROL_RANGE")
+        ));
+
+        let mut slider = create_control(
+            "滑块",
+            &BTreeMap::from([
+                ("最小值".into(), Data::Integer(0)),
+                ("最大值".into(), Data::Integer(10)),
+            ]),
+        )
+        .expect("valid slider");
+        apply_control_config(
+            &mut slider,
+            &BTreeMap::from([("值".into(), Data::Integer(5))]),
+        )
+        .expect("value inside slider range");
+        assert_eq!(
+            set_control_property(&mut slider, "值", &Data::Integer(11)),
+            Err("GUI_CONTROL_RANGE")
+        );
+        assert_eq!(slider.value, 5.0);
+
+        let mut select = create_control(
+            "下拉选择",
+            &BTreeMap::from([("选项".into(), string_array(&["甲", "乙"]))]),
+        )
+        .expect("valid select");
+        assert_eq!(
+            set_control_property(&mut select, "当前项", &Data::Integer(2)),
+            Err("GUI_CONTROL_RANGE")
+        );
+        assert_eq!(select.selected_index, 0);
+
+        let mut common = Common::default();
+        assert_eq!(
+            set_common_property(&mut common, "宽", &Data::Integer(100)),
+            Ok(true)
+        );
+        assert_eq!(
+            set_common_property(&mut common, "最小宽", &Data::Integer(120)),
+            Err("GUI_SIZE_RANGE")
+        );
+        assert_eq!(common.minimum_width, None);
+        assert_eq!(resolved_control_size(&common, 20.0), [100.0, 24.0]);
+
+        common.width = None;
+        common.minimum_width = Some(80.0);
+        common.maximum_width = Some(120.0);
+        assert_eq!(resolved_control_size(&common, 20.0), [80.0, 24.0]);
+        assert_eq!(resolved_control_size(&common, 200.0), [120.0, 24.0]);
     }
 }
