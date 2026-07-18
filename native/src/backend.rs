@@ -574,6 +574,9 @@ unsafe fn resource_any<'a>(
     if resource.host.0.event_loop_id != host.0.event_loop_id {
         return Err("GUI_RESOURCE_LOOP");
     }
+    if resource.host.0.owner_thread_token != host.0.owner_thread_token {
+        return Err("GUI_RESOURCE_THREAD");
+    }
     lock_model(&resource.model)?
         .node_mut(resource.id)?
         .public_handle = *handle;
@@ -2398,6 +2401,19 @@ mod tests {
             Data::String("取消".into()),
             Data::Bool(true),
         ];
+
+        let mut wrong_thread_table = host.0;
+        wrong_thread_table.owner_thread_token = 2;
+        assert!(matches!(
+            unsafe {
+                call(
+                    Operation::GetProperty,
+                    &[Data::Resource(7), Data::String("已取消".into())],
+                    HostApi(wrong_thread_table),
+                )
+            },
+            Err("GUI_RESOURCE_THREAD")
+        ));
 
         assert!(matches!(
             unsafe { call(Operation::SetProperty, &arguments, host) },
