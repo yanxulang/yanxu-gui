@@ -306,7 +306,7 @@ pub struct TimerState {
     pub interval: Duration,
     pub repeating: bool,
     pub next: Instant,
-    pub callback: u64,
+    pub callback: Option<u64>,
     pub cancelled: bool,
 }
 
@@ -412,7 +412,7 @@ impl Model {
         }
         callbacks.extend(node.events.into_values());
         match node.kind {
-            NodeKind::Timer(timer) => callbacks.push(timer.callback),
+            NodeKind::Timer(timer) => callbacks.extend(timer.callback),
             NodeKind::Application { .. } => self.exit_requested = true,
             _ => {}
         }
@@ -430,7 +430,7 @@ impl Model {
         for (_, node) in std::mem::take(&mut self.nodes) {
             callbacks.extend(node.events.into_values());
             if let NodeKind::Timer(timer) = node.kind {
-                callbacks.push(timer.callback);
+                callbacks.extend(timer.callback);
             }
         }
         self.roots.clear();
@@ -448,7 +448,10 @@ impl Model {
             if timer.cancelled || timer.next > now {
                 continue;
             }
-            due.push((node.id, timer.callback));
+            let Some(callback) = timer.callback else {
+                continue;
+            };
+            due.push((node.id, callback));
             if timer.repeating {
                 while timer.next <= now {
                     timer.next += timer.interval;
@@ -533,7 +536,7 @@ mod tests {
             .create(
                 Some(app),
                 NodeKind::Timer(TimerState {
-                    callback: 11,
+                    callback: Some(11),
                     interval: Duration::from_millis(5),
                     next: Instant::now(),
                     repeating: true,

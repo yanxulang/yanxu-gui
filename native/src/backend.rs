@@ -274,7 +274,9 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            set_property(resource, text(&arguments[1])?, &arguments[2])?;
+            if let Some(callback) = set_property(resource, text(&arguments[1])?, &arguments[2])? {
+                host.release(callback);
+            }
             Ok(Output::Value(Data::Nil))
         }
         Operation::GetProperty => {
@@ -395,7 +397,7 @@ pub unsafe fn call(
                 interval: Duration::from_millis(u64::from(milliseconds)),
                 repeating,
                 next: Instant::now() + Duration::from_millis(u64::from(milliseconds)),
-                callback,
+                callback: Some(callback),
                 cancelled: false,
             };
             let result = lock_model(&parent.model)
@@ -786,9 +788,14 @@ fn apply_control_config(
     Ok(())
 }
 
-fn set_property(resource: &GuiResource, key: &str, value: &Data) -> Result<(), &'static str> {
+fn set_property(
+    resource: &GuiResource,
+    key: &str,
+    value: &Data,
+) -> Result<Option<u64>, &'static str> {
     let mut model = lock_model(&resource.model)?;
     let node = model.node_mut(resource.id)?;
+    let mut callback_to_release = None;
     match key {
         "可见" => node.common.visible = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
         "启用" => node.common.enabled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
@@ -842,12 +849,18 @@ fn set_property(resource: &GuiResource, key: &str, value: &Data) -> Result<(), &
             },
             NodeKind::Control(control) => set_control_property(control, key, value)?,
             NodeKind::Timer(timer) => match key {
-                "取消" => timer.cancelled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+                "取消" => {
+                    if !value.as_bool().ok_or("GUI_VALUE_TYPE")? {
+                        return Err("GUI_TIMER_STATE");
+                    }
+                    timer.cancelled = true;
+                    callback_to_release = timer.callback.take();
+                }
                 _ => return Err("GUI_PROPERTY"),
             },
         },
     }
-    Ok(())
+    Ok(callback_to_release)
 }
 
 fn set_control_property(
@@ -2115,6 +2128,30 @@ mod tests {
         abi::OK
     }
 
+    struct TimerHostTrace {
+        resource: *mut c_void,
+        released: Vec<u64>,
+    }
+
+    unsafe extern "C" fn trace_release(context: *mut c_void, callback: u64) -> i32 {
+        let trace = unsafe { &mut *context.cast::<TimerHostTrace>() };
+        trace.released.push(callback);
+        abi::OK
+    }
+
+    unsafe extern "C" fn trace_resource_get(
+        context: *mut c_void,
+        _handle: u64,
+        output: *mut *mut c_void,
+    ) -> i32 {
+        let trace = unsafe { &*context.cast::<TimerHostTrace>() };
+        if output.is_null() || trace.resource.is_null() {
+            return abi::ERROR;
+        }
+        unsafe { *output = trace.resource };
+        abi::OK
+    }
+
     fn string_array(values: &[&str]) -> Data {
         Data::Array(
             values
@@ -2266,6 +2303,90 @@ mod tests {
         assert_eq!(trace.steps, ["post:10", "pump", "post:20", "pump"]);
         deliver_pending(host, &mut pending);
         assert_eq!(trace.steps.last().map(String::as_str), Some("pump"));
+    }
+
+    #[test]
+    fn cancelling_a_timer_releases_its_retained_callback_exactly_once() {
+        let model = Arc::new(Mutex::new(Model::default()));
+        let (app, timer) = {
+            let mut model = model.lock().expect("fresh model");
+            let app = model
+                .create(
+                    None,
+                    NodeKind::Application {
+                        title: "测试".into(),
+                        theme: "系统".into(),
+                    },
+                )
+                .expect("create application");
+            let timer = model
+                .create(
+                    Some(app),
+                    NodeKind::Timer(TimerState {
+                        interval: Duration::from_millis(10),
+                        repeating: true,
+                        next: Instant::now() + Duration::from_secs(1),
+                        callback: Some(42),
+                        cancelled: false,
+                    }),
+                )
+                .expect("create timer");
+            (app, timer)
+        };
+        let mut trace = TimerHostTrace {
+            resource: std::ptr::null_mut(),
+            released: Vec::new(),
+        };
+        let host = HostApi(NativeHost {
+            abi_version: abi::ABI,
+            struct_size: std::mem::size_of::<NativeHost>(),
+            context: (&raw mut trace).cast(),
+            callback_retain: None,
+            callback_release: Some(trace_release),
+            callback_post: None,
+            wake: None,
+            pump: None,
+            has_permission: None,
+            resource_get: Some(trace_resource_get),
+            event_loop_id: 1,
+            owner_thread_token: 1,
+        });
+        let mut resource = GuiResource {
+            model: Arc::clone(&model),
+            kind: ResourceKind::Timer,
+            id: timer,
+            host,
+            cleaned: AtomicBool::new(false),
+        };
+        trace.resource = (&raw mut resource).cast();
+        let arguments = [
+            Data::Resource(7),
+            Data::String("取消".into()),
+            Data::Bool(true),
+        ];
+
+        assert!(matches!(
+            unsafe { call(Operation::SetProperty, &arguments, host) },
+            Ok(Output::Value(Data::Nil))
+        ));
+        assert!(matches!(
+            unsafe { call(Operation::SetProperty, &arguments, host) },
+            Ok(Output::Value(Data::Nil))
+        ));
+
+        assert_eq!(trace.released, [42]);
+        let model = lock_model(&model).expect("model remains healthy");
+        let NodeKind::Timer(timer_state) =
+            &model.node(timer).expect("timer remains queryable").kind
+        else {
+            panic!("expected timer node");
+        };
+        assert!(timer_state.cancelled);
+        assert_eq!(timer_state.callback, None);
+        assert_eq!(
+            model.node(app).expect("application remains live").children,
+            [timer]
+        );
     }
 
     #[test]
