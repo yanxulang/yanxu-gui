@@ -614,25 +614,49 @@ fn callback(value: &Data) -> Result<u64, &'static str> {
     }
 }
 
-fn map_text(map: &BTreeMap<String, Data>, key: &str) -> Option<String> {
-    map.get(key).and_then(Data::as_text).map(str::to_owned)
+fn map_text(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<String>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(Data::String(value)) => Ok(Some(value.clone())),
+        _ => Err("GUI_VALUE_TYPE"),
+    }
 }
 
-fn map_bool(map: &BTreeMap<String, Data>, key: &str) -> Option<bool> {
-    map.get(key).and_then(Data::as_bool)
+fn map_bool(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<bool>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(Data::Bool(value)) => Ok(Some(*value)),
+        _ => Err("GUI_VALUE_TYPE"),
+    }
 }
 
-fn map_number(map: &BTreeMap<String, Data>, key: &str) -> Option<f64> {
-    map.get(key).and_then(Data::as_f64)
+fn map_number(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<f64>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(value) => value.as_f64().map(Some).ok_or("GUI_VALUE_TYPE"),
+    }
 }
 
-fn map_strings(map: &BTreeMap<String, Data>, key: &str) -> Option<Vec<String>> {
-    match map.get(key)? {
-        Data::Array(values) => values
+fn map_u32(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<u32>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(value) => value.as_u32().map(Some).ok_or("GUI_VALUE_TYPE"),
+    }
+}
+
+fn map_strings(
+    map: &BTreeMap<String, Data>,
+    key: &str,
+) -> Result<Option<Vec<String>>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(Data::Array(values)) => values
             .iter()
             .map(|value| value.as_text().map(str::to_owned))
-            .collect(),
-        _ => None,
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or("GUI_VALUE_TYPE"),
+        _ => Err("GUI_VALUE_TYPE"),
     }
 }
 
@@ -640,11 +664,11 @@ fn apply_window_config(
     window: &mut WindowState,
     config: &BTreeMap<String, Data>,
 ) -> Result<(), &'static str> {
-    window.title = map_text(config, "标题").unwrap_or_else(|| window.title.clone());
-    window.width = positive_f32(map_number(config, "宽"), window.width)?;
-    window.height = positive_f32(map_number(config, "高"), window.height)?;
-    window.minimum_width = positive_f32(map_number(config, "最小宽"), window.minimum_width)?;
-    window.minimum_height = positive_f32(map_number(config, "最小高"), window.minimum_height)?;
+    window.title = map_text(config, "标题")?.unwrap_or_else(|| window.title.clone());
+    window.width = positive_f32(map_number(config, "宽")?, window.width)?;
+    window.height = positive_f32(map_number(config, "高")?, window.height)?;
+    window.minimum_width = positive_f32(map_number(config, "最小宽")?, window.minimum_width)?;
+    window.minimum_height = positive_f32(map_number(config, "最小高")?, window.minimum_height)?;
     window.maximum_width = optional_positive_f32(config.get("最大宽"))?;
     window.maximum_height = optional_positive_f32(config.get("最大高"))?;
     if window.minimum_width > window.width
@@ -658,13 +682,17 @@ fn apply_window_config(
     {
         return Err("GUI_WINDOW_SIZE");
     }
-    window.resizable = map_bool(config, "可缩放").unwrap_or(true);
-    window.high_dpi = map_bool(config, "高分屏").unwrap_or(true);
-    window.always_on_top = map_bool(config, "置顶").unwrap_or(false);
-    window.centered = map_bool(config, "居中").unwrap_or(false);
-    if let Some(Data::Bytes(icon)) = config.get("图标") {
-        image::load_from_memory(icon).map_err(|_| "GUI_IMAGE")?;
-        window.icon = Some(icon.clone());
+    window.resizable = map_bool(config, "可缩放")?.unwrap_or(true);
+    window.high_dpi = map_bool(config, "高分屏")?.unwrap_or(true);
+    window.always_on_top = map_bool(config, "置顶")?.unwrap_or(false);
+    window.centered = map_bool(config, "居中")?.unwrap_or(false);
+    match config.get("图标") {
+        None | Some(Data::Nil) => {}
+        Some(Data::Bytes(icon)) => {
+            image::load_from_memory(icon).map_err(|_| "GUI_IMAGE")?;
+            window.icon = Some(icon.clone());
+        }
+        _ => return Err("GUI_VALUE_TYPE"),
     }
     Ok(())
 }
@@ -680,7 +708,7 @@ fn positive_f32(value: Option<f64>, default: f32) -> Result<f32, &'static str> {
 fn optional_positive_f32(value: Option<&Data>) -> Result<Option<f32>, &'static str> {
     match value {
         None | Some(Data::Nil) => Ok(None),
-        Some(value) => positive_f32(value.as_f64(), 0.0).map(Some),
+        Some(value) => positive_f32(Some(value.as_f64().ok_or("GUI_VALUE_TYPE")?), 0.0).map(Some),
     }
 }
 
@@ -699,19 +727,21 @@ fn apply_layout_config(
     layout: &mut LayoutState,
     config: &BTreeMap<String, Data>,
 ) -> Result<(), &'static str> {
-    if let Some(columns) = config.get("列数").and_then(Data::as_u32) {
+    if let Some(columns) = map_u32(config, "列数")? {
         if !(1..=64).contains(&columns) {
             return Err("GUI_LAYOUT_RANGE");
         }
         layout.columns = columns as usize;
     }
-    layout.spacing = map_number(config, "间距").unwrap_or(8.0).clamp(0.0, 512.0) as f32;
-    layout.padding = map_number(config, "内边距")
+    layout.spacing = map_number(config, "间距")?.unwrap_or(8.0).clamp(0.0, 512.0) as f32;
+    layout.padding = map_number(config, "内边距")?
         .unwrap_or(8.0)
         .clamp(0.0, 512.0) as f32;
-    layout.grow = map_number(config, "伸缩").unwrap_or(0.0).clamp(0.0, 1000.0) as f32;
-    layout.horizontal_alignment = map_text(config, "水平对齐").unwrap_or_else(|| "左".into());
-    layout.vertical_alignment = map_text(config, "垂直对齐").unwrap_or_else(|| "上".into());
+    layout.grow = map_number(config, "伸缩")?
+        .unwrap_or(0.0)
+        .clamp(0.0, 1000.0) as f32;
+    layout.horizontal_alignment = map_text(config, "水平对齐")?.unwrap_or_else(|| "左".into());
+    layout.vertical_alignment = map_text(config, "垂直对齐")?.unwrap_or_else(|| "上".into());
     Ok(())
 }
 
@@ -724,40 +754,41 @@ fn create_control(
         "按钮" => ControlKind::Button,
         "输入框" => ControlKind::Input {
             multiline: false,
-            placeholder: map_text(config, "占位").unwrap_or_default(),
+            placeholder: map_text(config, "占位")?.unwrap_or_default(),
         },
         "多行输入框" => ControlKind::Input {
             multiline: true,
-            placeholder: map_text(config, "占位").unwrap_or_default(),
+            placeholder: map_text(config, "占位")?.unwrap_or_default(),
         },
         "复选框" => ControlKind::Checkbox,
         "单选框" => ControlKind::Radio {
-            group: map_text(config, "组").unwrap_or_default(),
+            group: map_text(config, "组")?.unwrap_or_default(),
         },
         "下拉选择" => ControlKind::Select {
-            options: map_strings(config, "选项").unwrap_or_default(),
+            options: map_strings(config, "选项")?.unwrap_or_default(),
         },
         "滑块" => ControlKind::Slider {
-            minimum: map_number(config, "最小值").unwrap_or(0.0),
-            maximum: map_number(config, "最大值").unwrap_or(100.0),
+            minimum: map_number(config, "最小值")?.unwrap_or(0.0),
+            maximum: map_number(config, "最大值")?.unwrap_or(100.0),
         },
         "进度条" => ControlKind::Progress,
         "图片" => ControlKind::Image {
             bytes: match config.get("图片") {
+                None | Some(Data::Nil) => Vec::new(),
                 Some(Data::Bytes(bytes)) => bytes.clone(),
-                _ => Vec::new(),
+                _ => return Err("GUI_VALUE_TYPE"),
             },
-            preserve_ratio: map_bool(config, "保持比例").unwrap_or(true),
+            preserve_ratio: map_bool(config, "保持比例")?.unwrap_or(true),
         },
         "列表" => ControlKind::List {
-            items: map_strings(config, "项目").unwrap_or_default(),
+            items: map_strings(config, "项目")?.unwrap_or_default(),
         },
         "分隔线" => ControlKind::Separator,
         "标签页" => ControlKind::Tabs {
-            tabs: map_strings(config, "标签").unwrap_or_default(),
+            tabs: map_strings(config, "标签")?.unwrap_or_default(),
         },
         "菜单" => ControlKind::Menu {
-            items: map_strings(config, "项目").unwrap_or_default(),
+            items: map_strings(config, "项目")?.unwrap_or_default(),
         },
         "Canvas" | "画布" => ControlKind::Canvas {
             commands: Vec::new(),
@@ -771,28 +802,30 @@ fn apply_control_config(
     control: &mut ControlState,
     config: &BTreeMap<String, Data>,
 ) -> Result<(), &'static str> {
-    control.text = map_text(config, "文字")
-        .or_else(|| map_text(config, "内容"))
+    control.text = map_text(config, "文字")?
+        .or(map_text(config, "内容")?)
         .unwrap_or_default();
-    control.selected = map_bool(config, "选中").unwrap_or(false);
-    control.value = map_number(config, "值").unwrap_or(0.0);
-    control.selected_index = config.get("当前项").and_then(Data::as_u32).unwrap_or(0) as usize;
+    control.selected = map_bool(config, "选中")?.unwrap_or(false);
+    control.value = map_number(config, "值")?.unwrap_or(0.0);
+    control.selected_index = map_u32(config, "当前项")?.unwrap_or(0) as usize;
     control.text_color = config.get("文字颜色").map(color).transpose()?;
     control.background_color = config.get("背景颜色").map(color).transpose()?;
     control.border_color = config.get("边框颜色").map(color).transpose()?;
-    control.border_width = map_number(config, "边框宽度")
+    control.border_width = map_number(config, "边框宽度")?
         .unwrap_or(0.0)
         .clamp(0.0, 64.0) as f32;
-    control.corner_radius = map_number(config, "圆角").unwrap_or(4.0).clamp(0.0, 512.0) as f32;
-    control.font_family = map_text(config, "字体").unwrap_or_default();
-    control.font_size = map_number(config, "字号").unwrap_or(14.0).clamp(6.0, 256.0) as f32;
-    control.font_weight = map_number(config, "字重")
+    control.corner_radius = map_number(config, "圆角")?.unwrap_or(4.0).clamp(0.0, 512.0) as f32;
+    control.font_family = map_text(config, "字体")?.unwrap_or_default();
+    control.font_size = map_number(config, "字号")?
+        .unwrap_or(14.0)
+        .clamp(6.0, 256.0) as f32;
+    control.font_weight = map_number(config, "字重")?
         .unwrap_or(400.0)
         .clamp(100.0, 900.0) as u16;
-    control.padding = map_number(config, "内边距")
+    control.padding = map_number(config, "内边距")?
         .unwrap_or(4.0)
         .clamp(0.0, 512.0) as f32;
-    control.margin = map_number(config, "外边距")
+    control.margin = map_number(config, "外边距")?
         .unwrap_or(0.0)
         .clamp(0.0, 512.0) as f32;
     Ok(())
@@ -1015,25 +1048,33 @@ fn parse_hex_color(value: &str) -> Result<[u8; 4], &'static str> {
 
 fn dialog(kind: &str, config: &BTreeMap<String, Data>) -> Result<Data, &'static str> {
     let mut dialog = rfd::FileDialog::new();
-    if let Some(title) = map_text(config, "标题") {
+    if let Some(title) = map_text(config, "标题")? {
         dialog = dialog.set_title(title);
     }
-    if let Some(directory) = map_text(config, "目录") {
+    if let Some(directory) = map_text(config, "目录")? {
         dialog = dialog.set_directory(directory);
     }
-    if let Some(name) = map_text(config, "文件名") {
+    if let Some(name) = map_text(config, "文件名")? {
         dialog = dialog.set_file_name(name);
     }
-    if let Some(Data::Array(filters)) = config.get("过滤") {
-        for filter in filters {
-            let Data::Map(filter) = filter else {
-                return Err("GUI_DIALOG_FILTER");
-            };
-            let name = map_text(filter, "名称").ok_or("GUI_DIALOG_FILTER")?;
-            let extensions = map_strings(filter, "扩展名").ok_or("GUI_DIALOG_FILTER")?;
-            let refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
-            dialog = dialog.add_filter(name, &refs);
+    match config.get("过滤") {
+        None | Some(Data::Nil) => {}
+        Some(Data::Array(filters)) => {
+            for filter in filters {
+                let Data::Map(filter) = filter else {
+                    return Err("GUI_DIALOG_FILTER");
+                };
+                let name = map_text(filter, "名称")?
+                    .filter(|name| !name.is_empty())
+                    .ok_or("GUI_DIALOG_FILTER")?;
+                let extensions = map_strings(filter, "扩展名")?
+                    .filter(|extensions| !extensions.is_empty())
+                    .ok_or("GUI_DIALOG_FILTER")?;
+                let refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
+                dialog = dialog.add_filter(name, &refs);
+            }
         }
+        _ => return Err("GUI_VALUE_TYPE"),
     }
     Ok(match kind {
         "打开文件" => dialog.pick_file().map_or(Data::Nil, path_data),
@@ -1051,7 +1092,7 @@ fn path_data(path: std::path::PathBuf) -> Data {
 }
 
 fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'static str> {
-    let kind = map_text(map, "类型").ok_or("GUI_CANVAS_COMMAND")?;
+    let kind = map_text(map, "类型")?.ok_or("GUI_CANVAS_COMMAND")?;
     let point = |name: &str| -> Result<[f32; 2], &'static str> {
         let Data::Array(values) = map.get(name).ok_or("GUI_CANVAS_COMMAND")? else {
             return Err("GUI_CANVAS_COMMAND");
@@ -1076,28 +1117,28 @@ fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'stati
             from: point("起点")?,
             to: point("终点")?,
             color: rgba("颜色", [255, 255, 255, 255])?,
-            width: map_number(map, "宽度").unwrap_or(1.0).clamp(0.1, 256.0) as f32,
+            width: map_number(map, "宽度")?.unwrap_or(1.0).clamp(0.1, 256.0) as f32,
         }),
         "矩形" => Ok(CanvasCommand::Rectangle {
             minimum: point("起点")?,
             maximum: point("终点")?,
             color: rgba("颜色", [0, 0, 0, 0])?,
             stroke: rgba("边框颜色", [255, 255, 255, 255])?,
-            stroke_width: map_number(map, "边框宽度").unwrap_or(1.0) as f32,
-            radius: map_number(map, "圆角").unwrap_or(0.0) as f32,
+            stroke_width: map_number(map, "边框宽度")?.unwrap_or(1.0) as f32,
+            radius: map_number(map, "圆角")?.unwrap_or(0.0) as f32,
         }),
         "圆" => Ok(CanvasCommand::Circle {
             center: point("圆心")?,
-            radius: map_number(map, "半径").ok_or("GUI_CANVAS_COMMAND")? as f32,
+            radius: map_number(map, "半径")?.ok_or("GUI_CANVAS_COMMAND")? as f32,
             color: rgba("颜色", [0, 0, 0, 0])?,
             stroke: rgba("边框颜色", [255, 255, 255, 255])?,
-            stroke_width: map_number(map, "边框宽度").unwrap_or(1.0) as f32,
+            stroke_width: map_number(map, "边框宽度")?.unwrap_or(1.0) as f32,
         }),
         "文字" => Ok(CanvasCommand::Text {
             position: point("位置")?,
-            text: map_text(map, "文字").ok_or("GUI_CANVAS_COMMAND")?,
+            text: map_text(map, "文字")?.ok_or("GUI_CANVAS_COMMAND")?,
             color: rgba("颜色", [255, 255, 255, 255])?,
-            size: map_number(map, "字号").unwrap_or(14.0) as f32,
+            size: map_number(map, "字号")?.unwrap_or(14.0) as f32,
         }),
         "图片" => Ok(CanvasCommand::Image {
             minimum: point("起点")?,
@@ -2505,5 +2546,31 @@ mod tests {
         assert!(parse_hex_color("not-a-color").is_err());
         assert!(canvas_command(&BTreeMap::new()).is_err());
         assert!(create_control("不存在", &BTreeMap::new()).is_err());
+
+        assert_eq!(
+            apply_window_config(
+                &mut WindowState::default(),
+                &BTreeMap::from([("标题".into(), Data::Integer(1))])
+            ),
+            Err("GUI_VALUE_TYPE")
+        );
+        assert_eq!(
+            apply_layout_config(
+                &mut LayoutState::new(LayoutKind::Grid),
+                &BTreeMap::from([("列数".into(), Data::String("二".into()))])
+            ),
+            Err("GUI_VALUE_TYPE")
+        );
+        assert!(matches!(
+            create_control(
+                "输入框",
+                &BTreeMap::from([("占位".into(), Data::Bool(true))])
+            ),
+            Err("GUI_VALUE_TYPE")
+        ));
+        assert!(matches!(
+            canvas_command(&BTreeMap::from([("类型".into(), Data::Integer(1))])),
+            Err("GUI_VALUE_TYPE")
+        ));
     }
 }
