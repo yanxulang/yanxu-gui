@@ -1150,6 +1150,18 @@ struct PendingEvent {
     event: Data,
 }
 
+fn deliver_pending(host: HostApi, pending: &mut Vec<PendingEvent>) {
+    let pending = std::mem::take(pending);
+    if pending.is_empty() {
+        let _ = host.pump();
+        return;
+    }
+    for event in pending {
+        let _ = host.post(event.callback, event.event);
+        let _ = host.pump();
+    }
+}
+
 struct DesktopApp {
     model: Arc<Mutex<Model>>,
     host: HostApi,
@@ -1254,11 +1266,7 @@ impl eframe::App for DesktopApp {
             context.request_repaint();
         }
         drop(model);
-        let pending = std::mem::take(&mut self.pending);
-        for event in pending {
-            let _ = self.host.post(event.callback, event.event);
-        }
-        let _ = self.host.pump();
+        deliver_pending(self.host, &mut self.pending);
     }
 }
 
@@ -2080,6 +2088,33 @@ fn event_data(kind: &str, node: &Node, details: Option<Data>) -> Data {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct DeliveryTrace {
+        steps: Vec<String>,
+    }
+
+    unsafe extern "C" fn trace_post(
+        context: *mut c_void,
+        callback: u64,
+        _arguments: *const crate::abi::Value,
+        _count: usize,
+        _error: *mut NativeError,
+    ) -> i32 {
+        let trace = unsafe { &mut *context.cast::<DeliveryTrace>() };
+        trace.steps.push(format!("post:{callback}"));
+        abi::OK
+    }
+
+    unsafe extern "C" fn trace_pump(
+        context: *mut c_void,
+        _maximum_events: usize,
+        _error: *mut NativeError,
+    ) -> i32 {
+        let trace = unsafe { &mut *context.cast::<DeliveryTrace>() };
+        trace.steps.push("pump".into());
+        abi::OK
+    }
+
     fn string_array(values: &[&str]) -> Data {
         Data::Array(
             values
@@ -2195,6 +2230,42 @@ mod tests {
         }
         assert_eq!(event["目标"], Data::Integer(99));
         assert_eq!(event["横坐标"], Data::Number(12.5));
+    }
+
+    #[test]
+    fn pending_events_are_pumped_before_the_next_callback_is_posted() {
+        let mut trace = DeliveryTrace::default();
+        let host = HostApi(NativeHost {
+            abi_version: abi::ABI,
+            struct_size: std::mem::size_of::<NativeHost>(),
+            context: (&raw mut trace).cast(),
+            callback_retain: None,
+            callback_release: None,
+            callback_post: Some(trace_post),
+            wake: None,
+            pump: Some(trace_pump),
+            has_permission: None,
+            resource_get: None,
+            event_loop_id: 1,
+            owner_thread_token: 1,
+        });
+        let mut pending = vec![
+            PendingEvent {
+                callback: 10,
+                event: Data::Nil,
+            },
+            PendingEvent {
+                callback: 20,
+                event: Data::Nil,
+            },
+        ];
+
+        deliver_pending(host, &mut pending);
+
+        assert!(pending.is_empty());
+        assert_eq!(trace.steps, ["post:10", "pump", "post:20", "pump"]);
+        deliver_pending(host, &mut pending);
+        assert_eq!(trace.steps.last().map(String::as_str), Some("pump"));
     }
 
     #[test]
