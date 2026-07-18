@@ -19,8 +19,9 @@ yanbao build --manifest-path 我的窗口 --release --bundle
 从多仓工作区根目录构建当前平台后端并生成带摘要的开发清单：
 
 ```sh
-cargo build --manifest-path yanxu-gui/Cargo.toml --release
-./yanxu-gui/scripts/prepare-current.sh
+cargo build --manifest-path yanxu-libraries-workspace/repos/yanxu-gui/Cargo.toml --release
+./yanxu-libraries-workspace/repos/yanxu-gui/scripts/prepare-current.sh \
+  yanxu-libraries-workspace/repos/yanxu-gui
 ```
 
 `prepare-current.sh` 只登记本次实际构建的平台制品；发布包由六目标 CI 分别构建、
