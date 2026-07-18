@@ -726,6 +726,32 @@ fn layout_kind(kind: &str) -> Result<LayoutKind, &'static str> {
     }
 }
 
+fn horizontal_alignment(name: &str) -> Result<egui::Align, &'static str> {
+    match name {
+        "左" => Ok(egui::Align::Min),
+        "中" => Ok(egui::Align::Center),
+        "右" => Ok(egui::Align::Max),
+        _ => Err("GUI_LAYOUT_ALIGN"),
+    }
+}
+
+fn vertical_alignment(name: &str) -> Result<egui::Align, &'static str> {
+    match name {
+        "上" => Ok(egui::Align::Min),
+        "中" => Ok(egui::Align::Center),
+        "下" => Ok(egui::Align::Max),
+        _ => Err("GUI_LAYOUT_ALIGN"),
+    }
+}
+
+fn layout_value(value: &Data, maximum: f64) -> Result<f32, &'static str> {
+    let value = value.as_f64().ok_or("GUI_VALUE_TYPE")?;
+    (0.0..=maximum)
+        .contains(&value)
+        .then_some(value as f32)
+        .ok_or("GUI_LAYOUT_RANGE")
+}
+
 fn apply_layout_config(
     layout: &mut LayoutState,
     config: &BTreeMap<String, Data>,
@@ -736,15 +762,22 @@ fn apply_layout_config(
         }
         layout.columns = columns as usize;
     }
-    layout.spacing = map_number(config, "间距")?.unwrap_or(8.0).clamp(0.0, 512.0) as f32;
-    layout.padding = map_number(config, "内边距")?
-        .unwrap_or(8.0)
-        .clamp(0.0, 512.0) as f32;
-    layout.grow = map_number(config, "伸缩")?
-        .unwrap_or(0.0)
-        .clamp(0.0, 1000.0) as f32;
+    let spacing = map_number(config, "间距")?.unwrap_or(8.0);
+    let padding = map_number(config, "内边距")?.unwrap_or(8.0);
+    let grow = map_number(config, "伸缩")?.unwrap_or(0.0);
+    if !(0.0..=512.0).contains(&spacing) || !(0.0..=127.0).contains(&padding) {
+        return Err("GUI_LAYOUT_RANGE");
+    }
+    if grow != 0.0 {
+        return Err("GUI_LAYOUT_FEATURE");
+    }
+    layout.spacing = spacing as f32;
+    layout.padding = padding as f32;
+    layout.grow = 0.0;
     layout.horizontal_alignment = map_text(config, "水平对齐")?.unwrap_or_else(|| "左".into());
     layout.vertical_alignment = map_text(config, "垂直对齐")?.unwrap_or_else(|| "上".into());
+    horizontal_alignment(&layout.horizontal_alignment)?;
+    vertical_alignment(&layout.vertical_alignment)?;
     Ok(())
 }
 
@@ -958,14 +991,13 @@ fn set_property(
             _ => return Err("GUI_PROPERTY"),
         },
         NodeKind::Layout(layout) => match key {
-            "间距" => {
-                layout.spacing = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
-            }
-            "内边距" => {
-                layout.padding = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
-            }
+            "间距" => layout.spacing = layout_value(value, 512.0)?,
+            "内边距" => layout.padding = layout_value(value, 127.0)?,
             "伸缩" => {
-                layout.grow = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 1000.0) as f32
+                if value.as_f64().ok_or("GUI_VALUE_TYPE")? != 0.0 {
+                    return Err("GUI_LAYOUT_FEATURE");
+                }
+                layout.grow = 0.0;
             }
             _ => return Err("GUI_PROPERTY"),
         },
@@ -1735,39 +1767,51 @@ impl DesktopApp {
         }
         match node.kind.clone() {
             NodeKind::Layout(layout) => {
-                ui.add_space(layout.padding);
-                match layout.kind {
-                    LayoutKind::Vertical => {
-                        ui.vertical(|ui| self.render_children(ui, model, id));
-                    }
-                    LayoutKind::Horizontal => {
-                        ui.horizontal(|ui| self.render_children(ui, model, id));
-                    }
-                    LayoutKind::Grid => {
-                        egui::Grid::new(("yanxu-grid", id))
-                            .num_columns(layout.columns)
-                            .spacing([layout.spacing, layout.spacing])
-                            .show(ui, |ui| {
-                                let children = model
-                                    .node(id)
-                                    .map(|node| node.children.clone())
-                                    .unwrap_or_default();
-                                for (index, child) in children.into_iter().enumerate() {
-                                    self.render_node(ui, model, child);
-                                    if (index + 1) % layout.columns == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    }
-                    LayoutKind::Stack => {
-                        ui.scope(|ui| self.render_children(ui, model, id));
-                    }
-                    LayoutKind::Scroll => {
-                        egui::ScrollArea::both().show(ui, |ui| self.render_children(ui, model, id));
-                    }
-                };
-                ui.add_space(layout.padding);
+                let horizontal =
+                    horizontal_alignment(&layout.horizontal_alignment).unwrap_or(egui::Align::Min);
+                let vertical =
+                    vertical_alignment(&layout.vertical_alignment).unwrap_or(egui::Align::Min);
+                egui::Frame::NONE
+                    .inner_margin(layout.padding)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(layout.spacing, layout.spacing);
+                        match layout.kind {
+                            LayoutKind::Vertical => {
+                                ui.with_layout(egui::Layout::top_down(horizontal), |ui| {
+                                    self.render_children(ui, model, id)
+                                });
+                            }
+                            LayoutKind::Horizontal => {
+                                ui.with_layout(egui::Layout::left_to_right(vertical), |ui| {
+                                    self.render_children(ui, model, id)
+                                });
+                            }
+                            LayoutKind::Grid => {
+                                egui::Grid::new(("yanxu-grid", id))
+                                    .num_columns(layout.columns)
+                                    .spacing([layout.spacing, layout.spacing])
+                                    .show(ui, |ui| {
+                                        let children = model
+                                            .node(id)
+                                            .map(|node| node.children.clone())
+                                            .unwrap_or_default();
+                                        for (index, child) in children.into_iter().enumerate() {
+                                            self.render_node(ui, model, child);
+                                            if (index + 1) % layout.columns == 0 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            }
+                            LayoutKind::Stack => {
+                                ui.scope(|ui| self.render_children(ui, model, id));
+                            }
+                            LayoutKind::Scroll => {
+                                egui::ScrollArea::both()
+                                    .show(ui, |ui| self.render_children(ui, model, id));
+                            }
+                        };
+                    });
             }
             NodeKind::Control(control) => self.render_control(ui, model, &node, control),
             _ => {}
@@ -1795,6 +1839,7 @@ impl DesktopApp {
                         egui::FontFamily::Proportional
                     },
                 ));
+                ui.spacing_mut().button_padding = egui::Vec2::splat(control.padding.min(127.0));
                 if let Some(color) = control.text_color {
                     ui.visuals_mut().override_text_color = Some(color32(color));
                 }
@@ -1842,7 +1887,8 @@ impl DesktopApp {
                     }
                     ControlKind::Checkbox => ui.checkbox(&mut control.selected, &control.text),
                     ControlKind::Radio { group } => {
-                        let response = ui
+                        let previous = control.selected;
+                        let mut response = ui
                             .push_id(group.as_str(), |ui| {
                                 ui.radio(control.selected, &control.text)
                             })
@@ -1850,21 +1896,29 @@ impl DesktopApp {
                         if response.clicked() {
                             control.selected = true;
                         }
+                        if previous != control.selected {
+                            response.mark_changed();
+                        }
                         response
                     }
                     ControlKind::Select { options } => {
+                        let previous = control.selected_index;
                         let selected = options
                             .get(control.selected_index)
                             .cloned()
                             .unwrap_or_default();
-                        egui::ComboBox::from_id_salt(("yanxu-select", node.id))
+                        let mut response = egui::ComboBox::from_id_salt(("yanxu-select", node.id))
                             .selected_text(selected)
                             .show_ui(ui, |ui| {
                                 for (index, option) in options.iter().enumerate() {
                                     ui.selectable_value(&mut control.selected_index, index, option);
                                 }
                             })
-                            .response
+                            .response;
+                        if previous != control.selected_index {
+                            response.mark_changed();
+                        }
+                        response
                     }
                     ControlKind::Slider { minimum, maximum } => {
                         ui.add(egui::Slider::new(&mut control.value, *minimum..=*maximum))
@@ -1901,28 +1955,40 @@ impl DesktopApp {
                     }
                     ControlKind::Separator => ui.separator(),
                     ControlKind::Tabs { tabs } => {
-                        ui.horizontal(|ui| {
-                            for (index, tab) in tabs.iter().enumerate() {
-                                if ui
-                                    .selectable_label(index == control.selected_index, tab)
-                                    .clicked()
-                                {
-                                    control.selected_index = index;
+                        let previous = control.selected_index;
+                        let mut response = ui
+                            .horizontal(|ui| {
+                                for (index, tab) in tabs.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(index == control.selected_index, tab)
+                                        .clicked()
+                                    {
+                                        control.selected_index = index;
+                                    }
                                 }
-                            }
-                        })
-                        .response
+                            })
+                            .response;
+                        if previous != control.selected_index {
+                            response.mark_changed();
+                        }
+                        response
                     }
                     ControlKind::Menu { items } => {
-                        ui.menu_button(&control.text, |ui| {
-                            for (index, item) in items.iter().enumerate() {
-                                if ui.button(item).clicked() {
-                                    control.selected_index = index;
-                                    ui.close();
+                        let previous = control.selected_index;
+                        let mut response = ui
+                            .menu_button(&control.text, |ui| {
+                                for (index, item) in items.iter().enumerate() {
+                                    if ui.button(item).clicked() {
+                                        control.selected_index = index;
+                                        ui.close();
+                                    }
                                 }
-                            }
-                        })
-                        .response
+                            })
+                            .response;
+                        if previous != control.selected_index {
+                            response.mark_changed();
+                        }
+                        response
                     }
                     ControlKind::Canvas { commands, .. } => {
                         self.render_canvas(ui, node.id, commands, width, height)
@@ -2819,6 +2885,20 @@ mod tests {
                 &BTreeMap::from([("列数".into(), Data::String("二".into()))])
             ),
             Err("GUI_VALUE_TYPE")
+        );
+        assert_eq!(
+            apply_layout_config(
+                &mut LayoutState::new(LayoutKind::Vertical),
+                &BTreeMap::from([("水平对齐".into(), Data::String("未知".into()))])
+            ),
+            Err("GUI_LAYOUT_ALIGN")
+        );
+        assert_eq!(
+            apply_layout_config(
+                &mut LayoutState::new(LayoutKind::Vertical),
+                &BTreeMap::from([("伸缩".into(), Data::Integer(1))])
+            ),
+            Err("GUI_LAYOUT_FEATURE")
         );
         assert!(matches!(
             create_control(
