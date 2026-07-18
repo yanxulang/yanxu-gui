@@ -225,7 +225,7 @@ unsafe fn free_value_inner(value: &mut Value) {
                 }
             }
         }
-        RESOURCE => {
+        RESOURCE if value.flags & FLAG_RESOURCE_HANDLE == 0 => {
             let pointer = unsafe { value.data.resource };
             if !pointer.is_null() {
                 let descriptor = unsafe { Box::from_raw(pointer) };
@@ -237,5 +237,26 @@ unsafe fn free_value_inner(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_resource_handles_are_not_freed_as_owned_descriptors() {
+        let handle = u64::MAX - 1;
+        let mut value = encode_data(Data::Resource(handle));
+
+        assert_eq!(value.kind, RESOURCE);
+        assert_eq!(value.flags, FLAG_RESOURCE_HANDLE);
+        assert_eq!(unsafe { value.data.handle }, handle);
+
+        unsafe { free_value(&mut value) };
+
+        assert_eq!(value.kind, NULL);
+        assert_eq!(value.flags, 0);
+        assert_eq!(value.length, 0);
     }
 }
