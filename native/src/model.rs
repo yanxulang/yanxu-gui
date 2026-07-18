@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const MAX_EVENTS_PER_NODE: usize = 128;
+const MAX_MODEL_NODES: usize = 65_536;
+const MAX_MODEL_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Data {
@@ -343,10 +345,23 @@ pub struct Model {
 
 impl Model {
     pub fn create(&mut self, parent: Option<u64>, kind: NodeKind) -> Result<u64, &'static str> {
+        if self.nodes.len() >= MAX_MODEL_NODES {
+            return Err("GUI_RESOURCE_LIMIT");
+        }
         if let Some(parent) = parent
             && !self.nodes.contains_key(&parent)
         {
             return Err("GUI_RESOURCE_CLOSED");
+        }
+        let mut ancestor = parent;
+        let mut parent_depth = 0;
+        while let Some(id) = ancestor {
+            let node = self.nodes.get(&id).ok_or("GUI_RESOURCE_CLOSED")?;
+            parent_depth += 1;
+            if parent_depth >= MAX_MODEL_DEPTH {
+                return Err("GUI_RESOURCE_LIMIT");
+            }
+            ancestor = node.parent;
         }
         self.next_id = self.next_id.checked_add(1).ok_or("GUI_RESOURCE_LIMIT")?;
         let id = self.next_id;
@@ -621,5 +636,56 @@ mod tests {
             Err("GUI_EVENT_LIMIT")
         );
         assert_eq!(model.bind_event(app, "事件0".into(), 1000), Ok(Some(0)));
+    }
+
+    #[test]
+    fn model_node_count_and_tree_depth_have_hard_limits() {
+        let mut deep = Model::default();
+        let mut parent = deep
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create root");
+        for _ in 1..MAX_MODEL_DEPTH {
+            parent = deep
+                .create(
+                    Some(parent),
+                    NodeKind::Layout(LayoutState::new(LayoutKind::Vertical)),
+                )
+                .expect("depth within limit");
+        }
+        assert_eq!(
+            deep.create(
+                Some(parent),
+                NodeKind::Layout(LayoutState::new(LayoutKind::Vertical))
+            ),
+            Err("GUI_RESOURCE_LIMIT")
+        );
+
+        let mut wide = Model::default();
+        for _ in 0..MAX_MODEL_NODES {
+            wide.create(
+                None,
+                NodeKind::Application {
+                    title: String::new(),
+                    theme: String::new(),
+                },
+            )
+            .expect("node count within limit");
+        }
+        assert_eq!(
+            wide.create(
+                None,
+                NodeKind::Application {
+                    title: String::new(),
+                    theme: String::new(),
+                }
+            ),
+            Err("GUI_RESOURCE_LIMIT")
+        );
     }
 }
