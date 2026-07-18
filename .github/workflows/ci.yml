@@ -2,16 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   native:
     name: ${{ matrix.target }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -42,59 +46,187 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev xvfb
-      - name: 准备 Rust 质量工具
-        run: rustup component add rustfmt clippy
+      - name: 固定 Rust 1.92.0 与质量工具
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.92.0
+          test "$(rustc --version | awk '{print $2}')" = "1.92.0"
       - name: 核对原生架构
         shell: bash
         env:
           EXPECTED_TARGET: ${{ matrix.target }}
         run: |
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
-      - name: 格式、单测与 Clippy
+      - name: 清单、文档结构与凭据门禁
+        shell: bash
         run: |
+          set -euo pipefail
+          for file in README.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md \
+            COMPATIBILITY.md SECURITY.md CONTRIBUTING.md 言序.toml.in \
+            .cargo/config.toml \
+            api/api-v1.json docs/API.md docs/GUIDE.md docs/ARCHITECTURE.md \
+            docs/ERRORS.md docs/MIGRATION.md docs/PERFORMANCE.md \
+            docs/SECURITY_MODEL.md docs/THIRD_PARTY.md \
+            docs/RELEASE_NOTES_1.0.0.md examples/言序.toml examples/言序.lock \
+            tests/言序.toml tests/言序.lock; do
+            test -s "$file"
+          done
+          test "$(find examples -maxdepth 1 -type f -name '*.yx' | wc -l)" -eq 9
+          test "$(find tests -maxdepth 1 -type f -name '*.yx' | wc -l)" -eq 3
+          test "$(grep -h -o '测试\.' tests/*.yx | wc -l)" -eq 38
+          test "$(find docs -maxdepth 1 -type f -name '*.md' | wc -l)" -eq 9
+          grep -Fxq 'version = "1.0.0"' Cargo.toml
+          grep -Fxq 'rust-version = "1.92"' Cargo.toml
+          grep -Fxq '名称 = "yanxu-gui"' 言序.toml.in
+          grep -Fxq '版本 = "1.0.0"' 言序.toml.in
+          grep -Fxq '言序 = ">=1.1.12"' 言序.toml.in
+          grep -Fxq '许可 = "MIT OR Apache-2.0"' 言序.toml.in
+          grep -Fxq '默认 = "src/主.yx"' 言序.toml.in
+          grep -Fxq '图形界面 = true' 言序.toml.in
+          grep -Fxq '剪贴板 = true' 言序.toml.in
+          grep -Fxq '文件对话框 = true' 言序.toml.in
+          grep -Fxq 'ABI = 2' 言序.toml.in
+          for manifest in examples/言序.toml tests/言序.toml; do
+            grep -Fxq '版本 = "1.0.0"' "$manifest"
+            grep -Fxq '言序 = ">=1.1.12"' "$manifest"
+            grep -Fq '版 = "^1.0"' "$manifest"
+            grep -Fxq '图形界面 = true' "$manifest"
+          done
+          grep -Fxq '剪贴板 = true' examples/言序.toml
+          grep -Fxq '文件对话框 = true' examples/言序.toml
+          grep -Fxq '剪贴板 = false' tests/言序.toml
+          grep -Fxq '文件对话框 = false' tests/言序.toml
+          grep -Fxq 'generator = "1.1.12"' examples/言序.lock
+          grep -Fxq 'generator = "1.1.12"' tests/言序.lock
+          for heading in '## 主要能力' '## 安装' '## 五分钟示例' \
+            '## 错误处理' '## 权限' '## 兼容性与已知限制' '## 文档'; do
+            grep -Fxq "$heading" README.md
+          done
+          if git grep -I -nE '(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----)' -- .; then
+            echo '受跟踪文件包含疑似凭据'
+            exit 1
+          fi
+      - name: Rust 格式、19 项以上单测与严格 Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo fmt --all -- --check
           cargo test --workspace --locked
-          cargo clippy --workspace --all-targets --locked -- -D warnings
+          test "$(cargo test --workspace --locked -- --list | grep -c ': test$')" -ge 19
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: 构建当前目标 ABI v2 后端
         run: cargo build --workspace --release --locked
       - name: 生成只含当前真实制品的包清单
         shell: bash
         run: ./scripts/prepare-current.sh
-      - name: 检出匹配的言序 1.1.7 工具链
+      - name: 检出固定的言序 1.1.12 工具链
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: YanXuLang/yanxu
-          path: yanxu-core
-          ref: main
-      - name: 类型检查示例并验证 API 制品无漂移
+          path: .yanxu/toolchain
+          ref: 0e66486b4723ba96ed0ee67a43f301a03da062d0 # yanxu 1.1.12
+      - name: 构建并核对言序 1.1.12
+        env:
+          YANXU_BUILD_SHA: 0e66486b4723ba96ed0ee67a43f301a03da062d0
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --manifest-path yanxu-core/Cargo.toml --locked --bin yanxu
+          cargo build --manifest-path .yanxu/toolchain/Cargo.toml --locked --release --bin yanxu
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
-          core="$GITHUB_WORKSPACE/yanxu-core/target/debug/yanxu$suffix"
+          core="$GITHUB_WORKSPACE/.yanxu/toolchain/target/release/yanxu$suffix"
+          "$core" 版本 --json > "$RUNNER_TEMP/yanxu-version.json"
+          jq -e '.schema_version == 2 and .version == "1.1.12" and
+            .commit_sha == "0e66486b4723ba96ed0ee67a43f301a03da062d0"' \
+            "$RUNNER_TEMP/yanxu-version.json"
+      - name: 锁图、示例、公共规格与 API 漂移
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            suffix=".exe"
+            YANXU_CACHE="$(cygpath -w "$RUNNER_TEMP/yanxu-cache")"
+          else
+            YANXU_CACHE="$RUNNER_TEMP/yanxu-cache"
+          fi
+          export YANXU_CACHE
+          core="$GITHUB_WORKSPACE/.yanxu/toolchain/target/release/yanxu$suffix"
+          "$core" 包 .
+          "$core" 包 examples
+          "$core" 包 tests
+
+          cp examples/言序.lock "$RUNNER_TEMP/examples-committed.lock"
+          cp tests/言序.lock "$RUNNER_TEMP/tests-committed.lock"
           "$core" 包 更新 examples
+          "$core" 包 锁 --离线 examples
+          "$core" 包 更新 tests
+          "$core" 包 锁 --离线 tests
+
+          normalize_lock() {
+            sed -E \
+              -e '/^target = /d' \
+              -e '/^checksum = /d' \
+              -e '/^path = "dist\//d' \
+              -e '/^size = /d' \
+              -e 's/(yanxu-gui@1\.0\.0#)[^"]+/\1<dynamic>/g' "$1"
+          }
+          normalize_lock "$RUNNER_TEMP/examples-committed.lock" \
+            > "$RUNNER_TEMP/examples-committed.normalized"
+          normalize_lock examples/言序.lock > "$RUNNER_TEMP/examples-updated.normalized"
+          cmp "$RUNNER_TEMP/examples-committed.normalized" \
+            "$RUNNER_TEMP/examples-updated.normalized"
+          normalize_lock "$RUNNER_TEMP/tests-committed.lock" \
+            > "$RUNNER_TEMP/tests-committed.normalized"
+          normalize_lock tests/言序.lock > "$RUNNER_TEMP/tests-updated.normalized"
+          cmp "$RUNNER_TEMP/tests-committed.normalized" "$RUNNER_TEMP/tests-updated.normalized"
+
+          cp examples/言序.lock "$RUNNER_TEMP/examples-first.lock"
+          cp tests/言序.lock "$RUNNER_TEMP/tests-first.lock"
+          "$core" 包 更新 examples
+          "$core" 包 更新 tests
+          cmp "$RUNNER_TEMP/examples-first.lock" examples/言序.lock
+          cmp "$RUNNER_TEMP/tests-first.lock" tests/言序.lock
+
           for file in examples/*.yx; do "$core" 查 "$file"; done
+          for file in tests/*.yx; do
+            "$core" 查 "$file"
+            "$core" 字节 "$file"
+          done
           "$core" 文 --json src/主.yx "$RUNNER_TEMP/api-v1.json"
           "$core" 文 src/主.yx "$RUNNER_TEMP/API.md"
           cmp api/api-v1.json "$RUNNER_TEMP/api-v1.json"
           cmp docs/API.md "$RUNNER_TEMP/API.md"
+          jq -e '(.declarations | length) == 27 and
+            ([.declarations[].methods[]?] | length) == 127' "$RUNNER_TEMP/api-v1.json"
       - name: Linux 虚拟显示真实窗口自动关闭冒烟
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          core="$GITHUB_WORKSPACE/yanxu-core/target/debug/yanxu"
+          core="$GITHUB_WORKSPACE/.yanxu/toolchain/target/release/yanxu"
           xvfb-run -a "$core" 字节 examples/自动关闭冒烟.yx
       - name: 核对 ABI v2 导出与制品摘要
         shell: bash
         env:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
+          set -euo pipefail
           test -f "$ARTIFACT"
-          grep -F "$(wc -c < "$ARTIFACT" | tr -d ' ')" 言序.toml
+          size="$(wc -c < "$ARTIFACT" | tr -d ' ')"
+          if command -v sha256sum >/dev/null 2>&1; then
+            checksum="$(sha256sum "$ARTIFACT" | awk '{print $1}')"
+          else
+            checksum="$(shasum -a 256 "$ARTIFACT" | awk '{print $1}')"
+          fi
+          grep -Fxq "大小 = $size" 言序.toml
+          grep -Fxq "校验和 = \"$checksum\"" 言序.toml
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             nm -gU "$ARTIFACT" | grep -F yanxu_native_module_v2
+            otool -D "$ARTIFACT" | tail -n +2 | \
+              grep -Fx '@rpath/libyanxu_gui_native.dylib'
+            codesign --verify --verbose=4 "$ARTIFACT"
           elif [[ "$RUNNER_OS" == "Windows" ]]; then
             vswhere=""
             for candidate in \
@@ -120,6 +252,11 @@ jobs:
             done
             test -x "$dumpbin"
             "$dumpbin" //exports "$ARTIFACT" | grep -F yanxu_native_module_v2
+            dependencies="$("$dumpbin" //dependents "$ARTIFACT")"
+            if printf '%s\n' "$dependencies" | grep -Eiq 'VCRUNTIME|MSVCP|UCRTBASE'; then
+              echo 'Windows 制品仍动态依赖 MSVC CRT'
+              exit 1
+            fi
           else
             nm -D "$ARTIFACT" | grep -F yanxu_native_module_v2
           fi
@@ -131,6 +268,11 @@ jobs:
             ${{ matrix.artifact }}
             言序.toml
             api/api-v1.json
+            docs/API.md
+            CHANGELOG.md
+            COMPATIBILITY.md
+            SECURITY.md
+            LICENSE
             LICENSE-MIT
             LICENSE-APACHE
           if-no-files-found: error
@@ -139,6 +281,7 @@ jobs:
     name: 汇总六目标官方包候选
     needs: native
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -156,7 +299,8 @@ jobs:
             x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           )
           for target in "${targets[@]}"; do
-            source_dir="$RUNNER_TEMP/native/yanxu-gui-$target/dist/$target"
+            artifact_dir="$RUNNER_TEMP/native/yanxu-gui-$target"
+            source_dir="$artifact_dir/dist/$target"
             test "$(find "$source_dir" -maxdepth 1 -type f | wc -l)" -eq 1
             source="$(find "$source_dir" -maxdepth 1 -type f -print -quit)"
             destination="dist/$target/$(basename "$source")"
@@ -170,6 +314,12 @@ jobs:
             case "$target" in aarch64-*) arch=arm64 ;; x86_64-*) arch=x64 ;; esac
             checksum="$(sha256sum "$destination" | awk '{print $1}')"
             size="$(wc -c < "$destination" | tr -d ' ')"
+            grep -Fxq "文件 = \"dist/$target/$(basename "$destination")\"" \
+              "$artifact_dir/言序.toml"
+            grep -Fxq "校验和 = \"$checksum\"" "$artifact_dir/言序.toml"
+            grep -Fxq "大小 = $size" "$artifact_dir/言序.toml"
+            cmp api/api-v1.json "$artifact_dir/api/api-v1.json"
+            cmp docs/API.md "$artifact_dir/docs/API.md"
             {
               printf '[原生.%s.%s]\n' "$os" "$arch"
               printf '文件 = "dist/%s/%s"\n' "$target" "$(basename "$destination")"
@@ -178,9 +328,19 @@ jobs:
             } >> 言序.toml
           done
           test "$(find dist -type f | wc -l)" -eq 6
+          test "$(grep -c '^\[原生\.' 言序.toml)" -eq 6
+          grep -Fxq '版本 = "1.0.0"' 言序.toml
+          grep -Fxq '言序 = ">=1.1.12"' 言序.toml
+          grep -Fxq 'ABI = 2' 言序.toml
           tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
             -czf yanxu-gui-six-targets.tar.gz \
-            src api docs examples dist 言序.toml README.md LICENSE-MIT LICENSE-APACHE
+            src api docs examples tests dist 言序.toml README.md LICENSE LICENSE-MIT \
+            LICENSE-APACHE CHANGELOG.md COMPATIBILITY.md SECURITY.md CONTRIBUTING.md
+          tar -tzf yanxu-gui-six-targets.tar.gz > "$RUNNER_TEMP/archive-files.txt"
+          grep -Fxq '言序.toml' "$RUNNER_TEMP/archive-files.txt"
+          grep -Fxq 'docs/RELEASE_NOTES_1.0.0.md' "$RUNNER_TEMP/archive-files.txt"
+          test "$(grep -Ec '^dist/[^/]+/(libyanxu_gui_native\.(so|dylib)|yanxu_gui_native\.dll)$' \
+            "$RUNNER_TEMP/archive-files.txt")" -eq 6
           sha256sum yanxu-gui-six-targets.tar.gz > yanxu-gui-six-targets.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -189,3 +349,42 @@ jobs:
             yanxu-gui-six-targets.tar.gz
             yanxu-gui-six-targets.sha256
           if-no-files-found: error
+
+  metadata:
+    name: 新增元数据门禁
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: 检查分支、PR 与新增提交
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+          PR_TITLE: ${{ github.event.pull_request.title || '' }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+        run: |
+          set -euo pipefail
+          if printf '%s\n%s\n%s\n' "$HEAD_BRANCH" "$PR_TITLE" "$PR_BODY" | \
+            grep -Eiq 'co[d]ex'; then
+            echo '分支或 PR 元数据包含禁用词'
+            exit 1
+          fi
+
+          base="$BASE_SHA"
+          if [[ -z "$base" ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            default_ref="refs/remotes/origin/$DEFAULT_BRANCH"
+            if git show-ref --verify --quiet "$default_ref"; then
+              base="$(git merge-base HEAD "$default_ref")"
+            else
+              base="$(git rev-list --max-parents=0 HEAD | tail -n 1)"
+            fi
+          fi
+          if git log "$base"..HEAD \
+            --format='%H%n%an%n%ae%n%cn%n%ce%n%s%n%b' | grep -Eiq 'co[d]ex'; then
+            echo '新增提交元数据包含禁用词'
+            exit 1
+          fi

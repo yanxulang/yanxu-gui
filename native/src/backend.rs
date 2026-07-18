@@ -3,10 +3,11 @@ use crate::bridge::{encode_data, free_value};
 use crate::model::*;
 use eframe::egui;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TYPE_APP: &[u8] = b"yanxu.gui.application";
@@ -14,6 +15,10 @@ const TYPE_WINDOW: &[u8] = b"yanxu.gui.window";
 const TYPE_LAYOUT: &[u8] = b"yanxu.gui.layout";
 const TYPE_CONTROL: &[u8] = b"yanxu.gui.control";
 const TYPE_TIMER: &[u8] = b"yanxu.gui.timer";
+const MAX_CANVAS_COMMANDS: usize = 16_384;
+const MAX_CANVAS_MEMORY: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 4_096;
+const MAX_IMAGE_DECODE_ALLOC: u64 = 96 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct HostApi(pub NativeHost);
@@ -71,11 +76,7 @@ impl GuiResource {
         if self.cleaned.swap(true, Ordering::AcqRel) {
             return;
         }
-        let callbacks = self
-            .model
-            .lock()
-            .expect("GUI model poisoned")
-            .remove(self.id);
+        let callbacks = lock_model_for_cleanup(&self.model).remove(self.id);
         for callback in callbacks {
             self.host.release(callback);
         }
@@ -103,6 +104,17 @@ pub struct ResourceOutput {
 pub enum Output {
     Value(Data),
     Resource(ResourceOutput),
+}
+
+fn lock_model(model: &Mutex<Model>) -> Result<MutexGuard<'_, Model>, &'static str> {
+    model.lock().map_err(|_| "GUI_BACKEND_STATE")
+}
+
+fn lock_model_for_cleanup(model: &Mutex<Model>) -> MutexGuard<'_, Model> {
+    match model.lock() {
+        Ok(model) => model,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,7 +183,7 @@ pub unsafe fn call(
             require_count(arguments, 1)?;
             let title = text(&arguments[0])?.to_owned();
             let model = Arc::new(Mutex::new(Model::default()));
-            let id = model.lock().unwrap().create(
+            let id = lock_model(&model)?.create(
                 None,
                 NodeKind::Application {
                     title,
@@ -194,11 +206,8 @@ pub unsafe fn call(
             let config = map(&arguments[1])?;
             let mut window = WindowState::default();
             apply_window_config(&mut window, config)?;
-            let id = parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Window(window))?;
+            let id =
+                lock_model(&parent.model)?.create(Some(parent.id), NodeKind::Window(window))?;
             Ok(resource_output(
                 parent.model.clone(),
                 ResourceKind::Window,
@@ -221,11 +230,8 @@ pub unsafe fn call(
             let config = map(&arguments[2])?;
             let mut layout = LayoutState::new(kind);
             apply_layout_config(&mut layout, config)?;
-            let id = parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Layout(layout))?;
+            let id =
+                lock_model(&parent.model)?.create(Some(parent.id), NodeKind::Layout(layout))?;
             Ok(resource_output(
                 parent.model.clone(),
                 ResourceKind::Layout,
@@ -247,11 +253,8 @@ pub unsafe fn call(
             let config = map(&arguments[2])?;
             let mut control = create_control(text(&arguments[1])?, config)?;
             apply_control_config(&mut control, config)?;
-            let id = parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Control(control))?;
+            let id =
+                lock_model(&parent.model)?.create(Some(parent.id), NodeKind::Control(control))?;
             Ok(resource_output(
                 parent.model.clone(),
                 ResourceKind::Control,
@@ -276,7 +279,9 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            set_property(resource, text(&arguments[1])?, &arguments[2])?;
+            if let Some(callback) = set_property(resource, text(&arguments[1])?, &arguments[2])? {
+                host.release(callback);
+            }
             Ok(Output::Value(Data::Nil))
         }
         Operation::GetProperty => {
@@ -310,15 +315,12 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            let event = text(&arguments[1])?.to_owned();
+            let event = event_name(&arguments[1])?.to_owned();
             let callback = callback(&arguments[2])?;
             host.retain(callback)?;
-            match resource
-                .model
-                .lock()
-                .unwrap()
-                .bind_event(resource.id, event, callback)
-            {
+            let result = lock_model(&resource.model)
+                .and_then(|mut model| model.bind_event(resource.id, event, callback));
+            match result {
                 Ok(previous) => {
                     if let Some(previous) = previous {
                         host.release(previous);
@@ -344,10 +346,7 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            resource
-                .model
-                .lock()
-                .unwrap()
+            lock_model(&resource.model)?
                 .node_mut(resource.id)?
                 .common
                 .visible = matches!(operation, Operation::Show);
@@ -380,7 +379,7 @@ pub unsafe fn call(
         Operation::Exit => {
             require_count(arguments, 1)?;
             let (_, resource) = unsafe { resource(arguments, host, ResourceKind::Application) }?;
-            let mut model = resource.model.lock().unwrap();
+            let mut model = lock_model(&resource.model)?;
             model.exit_requested = true;
             model.repaint_requested = true;
             if let Some(wake) = host.0.wake {
@@ -403,15 +402,12 @@ pub unsafe fn call(
                 interval: Duration::from_millis(u64::from(milliseconds)),
                 repeating,
                 next: Instant::now() + Duration::from_millis(u64::from(milliseconds)),
-                callback,
+                callback: Some(callback),
                 cancelled: false,
             };
-            let id = match parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Timer(timer))
-            {
+            let result = lock_model(&parent.model)
+                .and_then(|mut model| model.create(Some(parent.id), NodeKind::Timer(timer)));
+            let id = match result {
                 Ok(id) => id,
                 Err(error) => {
                     host.release(callback);
@@ -434,7 +430,7 @@ pub unsafe fn call(
             if !matches!(theme, "亮色" | "暗色" | "系统") {
                 return Err("GUI_THEME");
             }
-            let mut model = resource.model.lock().unwrap();
+            let mut model = lock_model(&resource.model)?;
             let NodeKind::Application { theme: current, .. } =
                 &mut model.node_mut(resource.id)?.kind
             else {
@@ -479,20 +475,18 @@ pub unsafe fn call(
             require_count(arguments, 2)?;
             let (_, resource) = unsafe { resource(arguments, host, ResourceKind::Control) }?;
             let command = canvas_command(map(&arguments[1])?)?;
-            let mut model = resource.model.lock().unwrap();
+            let mut model = lock_model(&resource.model)?;
             let NodeKind::Control(control) = &mut model.node_mut(resource.id)?.kind else {
                 return Err("GUI_RESOURCE_TYPE");
             };
-            let ControlKind::Canvas { commands } = &mut control.kind else {
+            let ControlKind::Canvas {
+                commands,
+                memory_bytes,
+            } = &mut control.kind
+            else {
                 return Err("GUI_CONTROL_TYPE");
             };
-            if matches!(command, CanvasCommand::Clear(_)) {
-                commands.clear();
-            }
-            if commands.len() >= 65_536 {
-                return Err("GUI_CANVAS_LIMIT");
-            }
-            commands.push(command);
+            append_canvas_command(commands, memory_bytes, command)?;
             Ok(Output::Value(Data::Nil))
         }
         Operation::EmitCustom => {
@@ -509,12 +503,12 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            let event = text(&arguments[1])?;
-            let node = resource.model.lock().unwrap().node(resource.id)?.clone();
+            let event = event_name(&arguments[1])?;
+            let node = lock_model(&resource.model)?.node(resource.id)?.clone();
             if let Some(callback) = node.events.get(event) {
                 host.post(
                     *callback,
-                    event_data(event, &node, Some(arguments[2].clone())),
+                    custom_event_data(event, &node, arguments[2].clone()),
                 )?;
                 host.pump()?;
             }
@@ -523,7 +517,7 @@ pub unsafe fn call(
         Operation::DebugSnapshot => {
             require_count(arguments, 1)?;
             let (_, resource) = unsafe { resource(arguments, host, ResourceKind::Application) }?;
-            let model = resource.model.lock().unwrap();
+            let model = lock_model(&resource.model)?;
             let mut result = BTreeMap::new();
             result.insert("资源总数".into(), Data::Integer(model.nodes.len() as i64));
             for (kind, count) in model.counts() {
@@ -577,17 +571,21 @@ unsafe fn resource_any<'a>(
         return Err("GUI_RESOURCE_CLOSED");
     }
     let resource = unsafe { &*raw.cast::<GuiResource>() };
-    if !kinds.contains(&resource.kind) || resource.cleaned.load(Ordering::Acquire) {
+    if resource.cleaned.load(Ordering::Acquire) {
+        return Err("GUI_RESOURCE_CLOSED");
+    }
+    if !kinds.contains(&resource.kind) {
         return Err("GUI_RESOURCE_TYPE");
     }
     if resource.host.0.event_loop_id != host.0.event_loop_id {
         return Err("GUI_RESOURCE_LOOP");
     }
-    if let Ok(mut model) = resource.model.lock()
-        && let Ok(node) = model.node_mut(resource.id)
-    {
-        node.public_handle = *handle;
+    if resource.host.0.owner_thread_token != host.0.owner_thread_token {
+        return Err("GUI_RESOURCE_THREAD");
     }
+    lock_model(&resource.model)?
+        .node_mut(resource.id)?
+        .public_handle = *handle;
     Ok((*handle, resource))
 }
 
@@ -599,6 +597,13 @@ fn require_count(arguments: &[Data], expected: usize) -> Result<(), &'static str
 
 fn text(value: &Data) -> Result<&str, &'static str> {
     value.as_text().ok_or("GUI_VALUE_TYPE")
+}
+
+fn event_name(value: &Data) -> Result<&str, &'static str> {
+    let event = text(value)?;
+    (!event.is_empty() && event.len() <= 256)
+        .then_some(event)
+        .ok_or("GUI_EVENT_NAME")
 }
 
 fn map(value: &Data) -> Result<&BTreeMap<String, Data>, &'static str> {
@@ -615,25 +620,49 @@ fn callback(value: &Data) -> Result<u64, &'static str> {
     }
 }
 
-fn map_text(map: &BTreeMap<String, Data>, key: &str) -> Option<String> {
-    map.get(key).and_then(Data::as_text).map(str::to_owned)
+fn map_text(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<String>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(Data::String(value)) => Ok(Some(value.clone())),
+        _ => Err("GUI_VALUE_TYPE"),
+    }
 }
 
-fn map_bool(map: &BTreeMap<String, Data>, key: &str) -> Option<bool> {
-    map.get(key).and_then(Data::as_bool)
+fn map_bool(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<bool>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(Data::Bool(value)) => Ok(Some(*value)),
+        _ => Err("GUI_VALUE_TYPE"),
+    }
 }
 
-fn map_number(map: &BTreeMap<String, Data>, key: &str) -> Option<f64> {
-    map.get(key).and_then(Data::as_f64)
+fn map_number(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<f64>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(value) => value.as_f64().map(Some).ok_or("GUI_VALUE_TYPE"),
+    }
 }
 
-fn map_strings(map: &BTreeMap<String, Data>, key: &str) -> Option<Vec<String>> {
-    match map.get(key)? {
-        Data::Array(values) => values
+fn map_u32(map: &BTreeMap<String, Data>, key: &str) -> Result<Option<u32>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(value) => value.as_u32().map(Some).ok_or("GUI_VALUE_TYPE"),
+    }
+}
+
+fn map_strings(
+    map: &BTreeMap<String, Data>,
+    key: &str,
+) -> Result<Option<Vec<String>>, &'static str> {
+    match map.get(key) {
+        None | Some(Data::Nil) => Ok(None),
+        Some(Data::Array(values)) => values
             .iter()
             .map(|value| value.as_text().map(str::to_owned))
-            .collect(),
-        _ => None,
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or("GUI_VALUE_TYPE"),
+        _ => Err("GUI_VALUE_TYPE"),
     }
 }
 
@@ -641,11 +670,11 @@ fn apply_window_config(
     window: &mut WindowState,
     config: &BTreeMap<String, Data>,
 ) -> Result<(), &'static str> {
-    window.title = map_text(config, "标题").unwrap_or_else(|| window.title.clone());
-    window.width = positive_f32(map_number(config, "宽"), window.width)?;
-    window.height = positive_f32(map_number(config, "高"), window.height)?;
-    window.minimum_width = positive_f32(map_number(config, "最小宽"), window.minimum_width)?;
-    window.minimum_height = positive_f32(map_number(config, "最小高"), window.minimum_height)?;
+    window.title = map_text(config, "标题")?.unwrap_or_else(|| window.title.clone());
+    window.width = positive_f32(map_number(config, "宽")?, window.width)?;
+    window.height = positive_f32(map_number(config, "高")?, window.height)?;
+    window.minimum_width = positive_f32(map_number(config, "最小宽")?, window.minimum_width)?;
+    window.minimum_height = positive_f32(map_number(config, "最小高")?, window.minimum_height)?;
     window.maximum_width = optional_positive_f32(config.get("最大宽"))?;
     window.maximum_height = optional_positive_f32(config.get("最大高"))?;
     if window.minimum_width > window.width
@@ -659,13 +688,17 @@ fn apply_window_config(
     {
         return Err("GUI_WINDOW_SIZE");
     }
-    window.resizable = map_bool(config, "可缩放").unwrap_or(true);
-    window.high_dpi = map_bool(config, "高分屏").unwrap_or(true);
-    window.always_on_top = map_bool(config, "置顶").unwrap_or(false);
-    window.centered = map_bool(config, "居中").unwrap_or(false);
-    if let Some(Data::Bytes(icon)) = config.get("图标") {
-        image::load_from_memory(icon).map_err(|_| "GUI_IMAGE")?;
-        window.icon = Some(icon.clone());
+    window.resizable = map_bool(config, "可缩放")?.unwrap_or(true);
+    window.high_dpi = map_bool(config, "高分屏")?.unwrap_or(true);
+    window.always_on_top = map_bool(config, "置顶")?.unwrap_or(false);
+    window.centered = map_bool(config, "居中")?.unwrap_or(false);
+    match config.get("图标") {
+        None | Some(Data::Nil) => {}
+        Some(Data::Bytes(icon)) => {
+            decode_image(icon)?;
+            window.icon = Some(icon.clone());
+        }
+        _ => return Err("GUI_VALUE_TYPE"),
     }
     Ok(())
 }
@@ -681,7 +714,7 @@ fn positive_f32(value: Option<f64>, default: f32) -> Result<f32, &'static str> {
 fn optional_positive_f32(value: Option<&Data>) -> Result<Option<f32>, &'static str> {
     match value {
         None | Some(Data::Nil) => Ok(None),
-        Some(value) => positive_f32(value.as_f64(), 0.0).map(Some),
+        Some(value) => positive_f32(Some(value.as_f64().ok_or("GUI_VALUE_TYPE")?), 0.0).map(Some),
     }
 }
 
@@ -696,23 +729,58 @@ fn layout_kind(kind: &str) -> Result<LayoutKind, &'static str> {
     }
 }
 
+fn horizontal_alignment(name: &str) -> Result<egui::Align, &'static str> {
+    match name {
+        "左" => Ok(egui::Align::Min),
+        "中" => Ok(egui::Align::Center),
+        "右" => Ok(egui::Align::Max),
+        _ => Err("GUI_LAYOUT_ALIGN"),
+    }
+}
+
+fn vertical_alignment(name: &str) -> Result<egui::Align, &'static str> {
+    match name {
+        "上" => Ok(egui::Align::Min),
+        "中" => Ok(egui::Align::Center),
+        "下" => Ok(egui::Align::Max),
+        _ => Err("GUI_LAYOUT_ALIGN"),
+    }
+}
+
+fn layout_value(value: &Data, maximum: f64) -> Result<f32, &'static str> {
+    let value = value.as_f64().ok_or("GUI_VALUE_TYPE")?;
+    (0.0..=maximum)
+        .contains(&value)
+        .then_some(value as f32)
+        .ok_or("GUI_LAYOUT_RANGE")
+}
+
 fn apply_layout_config(
     layout: &mut LayoutState,
     config: &BTreeMap<String, Data>,
 ) -> Result<(), &'static str> {
-    if let Some(columns) = config.get("列数").and_then(Data::as_u32) {
+    if let Some(columns) = map_u32(config, "列数")? {
         if !(1..=64).contains(&columns) {
             return Err("GUI_LAYOUT_RANGE");
         }
         layout.columns = columns as usize;
     }
-    layout.spacing = map_number(config, "间距").unwrap_or(8.0).clamp(0.0, 512.0) as f32;
-    layout.padding = map_number(config, "内边距")
-        .unwrap_or(8.0)
-        .clamp(0.0, 512.0) as f32;
-    layout.grow = map_number(config, "伸缩").unwrap_or(0.0).clamp(0.0, 1000.0) as f32;
-    layout.horizontal_alignment = map_text(config, "水平对齐").unwrap_or_else(|| "左".into());
-    layout.vertical_alignment = map_text(config, "垂直对齐").unwrap_or_else(|| "上".into());
+    let spacing = map_number(config, "间距")?.unwrap_or(8.0);
+    let padding = map_number(config, "内边距")?.unwrap_or(8.0);
+    let grow = map_number(config, "伸缩")?.unwrap_or(0.0);
+    if !(0.0..=512.0).contains(&spacing) || !(0.0..=127.0).contains(&padding) {
+        return Err("GUI_LAYOUT_RANGE");
+    }
+    if grow != 0.0 {
+        return Err("GUI_LAYOUT_FEATURE");
+    }
+    layout.spacing = spacing as f32;
+    layout.padding = padding as f32;
+    layout.grow = 0.0;
+    layout.horizontal_alignment = map_text(config, "水平对齐")?.unwrap_or_else(|| "左".into());
+    layout.vertical_alignment = map_text(config, "垂直对齐")?.unwrap_or_else(|| "上".into());
+    horizontal_alignment(&layout.horizontal_alignment)?;
+    vertical_alignment(&layout.vertical_alignment)?;
     Ok(())
 }
 
@@ -725,142 +793,230 @@ fn create_control(
         "按钮" => ControlKind::Button,
         "输入框" => ControlKind::Input {
             multiline: false,
-            placeholder: map_text(config, "占位").unwrap_or_default(),
+            placeholder: map_text(config, "占位")?.unwrap_or_default(),
         },
         "多行输入框" => ControlKind::Input {
             multiline: true,
-            placeholder: map_text(config, "占位").unwrap_or_default(),
+            placeholder: map_text(config, "占位")?.unwrap_or_default(),
         },
         "复选框" => ControlKind::Checkbox,
         "单选框" => ControlKind::Radio {
-            group: map_text(config, "组").unwrap_or_default(),
+            group: map_text(config, "组")?.unwrap_or_default(),
         },
         "下拉选择" => ControlKind::Select {
-            options: map_strings(config, "选项").unwrap_or_default(),
+            options: map_strings(config, "选项")?.unwrap_or_default(),
         },
         "滑块" => ControlKind::Slider {
-            minimum: map_number(config, "最小值").unwrap_or(0.0),
-            maximum: map_number(config, "最大值").unwrap_or(100.0),
+            minimum: map_number(config, "最小值")?.unwrap_or(0.0),
+            maximum: map_number(config, "最大值")?.unwrap_or(100.0),
         },
         "进度条" => ControlKind::Progress,
         "图片" => ControlKind::Image {
             bytes: match config.get("图片") {
-                Some(Data::Bytes(bytes)) => bytes.clone(),
-                _ => Vec::new(),
+                None | Some(Data::Nil) => Vec::new(),
+                Some(Data::Bytes(bytes)) => {
+                    decode_image(bytes)?;
+                    bytes.clone()
+                }
+                _ => return Err("GUI_VALUE_TYPE"),
             },
-            preserve_ratio: map_bool(config, "保持比例").unwrap_or(true),
+            preserve_ratio: map_bool(config, "保持比例")?.unwrap_or(true),
         },
         "列表" => ControlKind::List {
-            items: map_strings(config, "项目").unwrap_or_default(),
+            items: map_strings(config, "项目")?.unwrap_or_default(),
         },
         "分隔线" => ControlKind::Separator,
         "标签页" => ControlKind::Tabs {
-            tabs: map_strings(config, "标签").unwrap_or_default(),
+            tabs: map_strings(config, "标签")?.unwrap_or_default(),
         },
         "菜单" => ControlKind::Menu {
-            items: map_strings(config, "项目").unwrap_or_default(),
+            items: map_strings(config, "项目")?.unwrap_or_default(),
         },
         "Canvas" | "画布" => ControlKind::Canvas {
             commands: Vec::new(),
+            memory_bytes: 0,
         },
         _ => return Err("GUI_CONTROL_TYPE"),
     };
-    Ok(ControlState::new(kind))
+    let mut control = ControlState::new(kind);
+    if let ControlKind::Slider { minimum, .. } = &control.kind {
+        control.value = *minimum;
+    }
+    validate_control_state(&control)?;
+    Ok(control)
 }
 
 fn apply_control_config(
     control: &mut ControlState,
     config: &BTreeMap<String, Data>,
 ) -> Result<(), &'static str> {
-    control.text = map_text(config, "文字")
-        .or_else(|| map_text(config, "内容"))
+    control.text = map_text(config, "文字")?
+        .or(map_text(config, "内容")?)
         .unwrap_or_default();
-    control.selected = map_bool(config, "选中").unwrap_or(false);
-    control.value = map_number(config, "值").unwrap_or(0.0);
-    control.selected_index = config.get("当前项").and_then(Data::as_u32).unwrap_or(0) as usize;
+    control.selected = map_bool(config, "选中")?.unwrap_or(false);
+    control.value = map_number(config, "值")?.unwrap_or(control.value);
+    control.selected_index =
+        map_u32(config, "当前项")?.unwrap_or(control.selected_index as u32) as usize;
     control.text_color = config.get("文字颜色").map(color).transpose()?;
     control.background_color = config.get("背景颜色").map(color).transpose()?;
     control.border_color = config.get("边框颜色").map(color).transpose()?;
-    control.border_width = map_number(config, "边框宽度")
+    control.border_width = map_number(config, "边框宽度")?
         .unwrap_or(0.0)
         .clamp(0.0, 64.0) as f32;
-    control.corner_radius = map_number(config, "圆角").unwrap_or(4.0).clamp(0.0, 512.0) as f32;
-    control.font_family = map_text(config, "字体").unwrap_or_default();
-    control.font_size = map_number(config, "字号").unwrap_or(14.0).clamp(6.0, 256.0) as f32;
-    control.font_weight = map_number(config, "字重")
+    control.corner_radius = map_number(config, "圆角")?.unwrap_or(4.0).clamp(0.0, 512.0) as f32;
+    control.font_family = map_text(config, "字体")?.unwrap_or_default();
+    control.font_size = map_number(config, "字号")?
+        .unwrap_or(14.0)
+        .clamp(6.0, 256.0) as f32;
+    control.font_weight = map_number(config, "字重")?
         .unwrap_or(400.0)
         .clamp(100.0, 900.0) as u16;
-    control.padding = map_number(config, "内边距")
+    control.padding = map_number(config, "内边距")?
         .unwrap_or(4.0)
         .clamp(0.0, 512.0) as f32;
-    control.margin = map_number(config, "外边距")
+    control.margin = map_number(config, "外边距")?
         .unwrap_or(0.0)
         .clamp(0.0, 512.0) as f32;
+    validate_control_state(control)
+}
+
+fn control_item_count(kind: &ControlKind) -> Option<usize> {
+    match kind {
+        ControlKind::Select { options } => Some(options.len()),
+        ControlKind::List { items } | ControlKind::Menu { items } => Some(items.len()),
+        ControlKind::Tabs { tabs } => Some(tabs.len()),
+        _ => None,
+    }
+}
+
+fn validate_control_state(control: &ControlState) -> Result<(), &'static str> {
+    validate_control_value(&control.kind, control.value)?;
+    validate_selected_index(&control.kind, control.selected_index)
+}
+
+fn validate_control_value(kind: &ControlKind, value: f64) -> Result<(), &'static str> {
+    match kind {
+        ControlKind::Slider { minimum, maximum }
+            if !(-1.0e12..=1.0e12).contains(minimum)
+                || !(-1.0e12..=1.0e12).contains(maximum)
+                || minimum >= maximum
+                || !(*minimum..=*maximum).contains(&value) =>
+        {
+            return Err("GUI_CONTROL_RANGE");
+        }
+        ControlKind::Progress if !(0.0..=1.0).contains(&value) => {
+            return Err("GUI_CONTROL_RANGE");
+        }
+        _ => {}
+    }
     Ok(())
 }
 
-fn set_property(resource: &GuiResource, key: &str, value: &Data) -> Result<(), &'static str> {
-    let mut model = resource.model.lock().unwrap();
-    let node = model.node_mut(resource.id)?;
-    match key {
-        "可见" => node.common.visible = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "启用" => node.common.enabled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "宽" => node.common.width = optional_positive_f32(Some(value))?,
-        "高" => node.common.height = optional_positive_f32(Some(value))?,
-        "最小宽" => node.common.minimum_width = optional_positive_f32(Some(value))?,
-        "最小高" => node.common.minimum_height = optional_positive_f32(Some(value))?,
-        "最大宽" => node.common.maximum_width = optional_positive_f32(Some(value))?,
-        "最大高" => node.common.maximum_height = optional_positive_f32(Some(value))?,
-        "工具提示" => node.common.tooltip = text(value)?.into(),
-        "焦点" => node.common.focus_requested = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "样式类" => node.common.style_class = text(value)?.into(),
-        "可访问名称" => node.common.accessible_name = text(value)?.into(),
-        "可访问描述" => node.common.accessible_description = text(value)?.into(),
-        _ => match &mut node.kind {
-            NodeKind::Application { title, theme } => match key {
-                "名称" => *title = text(value)?.into(),
-                "主题" => *theme = text(value)?.into(),
-                _ => return Err("GUI_PROPERTY"),
-            },
-            NodeKind::Window(window) => match key {
-                "标题" => window.title = text(value)?.into(),
-                "最大化" => window.maximized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "最小化" => window.minimized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "全屏" => window.fullscreen = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "置顶" => window.always_on_top = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "可缩放" => window.resizable = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "居中" => window.centered = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                "图标" => {
-                    let Data::Bytes(bytes) = value else {
-                        return Err("GUI_VALUE_TYPE");
-                    };
-                    image::load_from_memory(bytes).map_err(|_| "GUI_IMAGE")?;
-                    window.icon = Some(bytes.clone());
-                }
-                _ => return Err("GUI_PROPERTY"),
-            },
-            NodeKind::Layout(layout) => match key {
-                "间距" => {
-                    layout.spacing =
-                        value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
-                }
-                "内边距" => {
-                    layout.padding =
-                        value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 512.0) as f32
-                }
-                "伸缩" => {
-                    layout.grow = value.as_f64().ok_or("GUI_VALUE_TYPE")?.clamp(0.0, 1000.0) as f32
-                }
-                _ => return Err("GUI_PROPERTY"),
-            },
-            NodeKind::Control(control) => set_control_property(control, key, value)?,
-            NodeKind::Timer(timer) => match key {
-                "取消" => timer.cancelled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-                _ => return Err("GUI_PROPERTY"),
-            },
-        },
+fn validate_selected_index(kind: &ControlKind, selected_index: usize) -> Result<(), &'static str> {
+    if let Some(count) = control_item_count(kind)
+        && ((count == 0 && selected_index != 0) || (count > 0 && selected_index >= count))
+    {
+        return Err("GUI_CONTROL_RANGE");
     }
     Ok(())
+}
+
+fn validate_common(common: &Common) -> Result<(), &'static str> {
+    for (value, minimum, maximum) in [
+        (common.width, common.minimum_width, common.maximum_width),
+        (common.height, common.minimum_height, common.maximum_height),
+    ] {
+        if minimum.zip(maximum).is_some_and(|(min, max)| min > max)
+            || value.zip(minimum).is_some_and(|(value, min)| value < min)
+            || value.zip(maximum).is_some_and(|(value, max)| value > max)
+        {
+            return Err("GUI_SIZE_RANGE");
+        }
+    }
+    Ok(())
+}
+
+fn set_common_property(common: &mut Common, key: &str, value: &Data) -> Result<bool, &'static str> {
+    let mut next = common.clone();
+    match key {
+        "可见" => next.visible = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+        "启用" => next.enabled = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+        "宽" => next.width = optional_positive_f32(Some(value))?,
+        "高" => next.height = optional_positive_f32(Some(value))?,
+        "最小宽" => next.minimum_width = optional_positive_f32(Some(value))?,
+        "最小高" => next.minimum_height = optional_positive_f32(Some(value))?,
+        "最大宽" => next.maximum_width = optional_positive_f32(Some(value))?,
+        "最大高" => next.maximum_height = optional_positive_f32(Some(value))?,
+        "工具提示" => next.tooltip = text(value)?.into(),
+        "焦点" => next.focus_requested = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+        "样式类" => next.style_class = text(value)?.into(),
+        "可访问名称" => next.accessible_name = text(value)?.into(),
+        "可访问描述" => next.accessible_description = text(value)?.into(),
+        _ => return Ok(false),
+    }
+    validate_common(&next)?;
+    *common = next;
+    Ok(true)
+}
+
+fn set_property(
+    resource: &GuiResource,
+    key: &str,
+    value: &Data,
+) -> Result<Option<u64>, &'static str> {
+    let mut model = lock_model(&resource.model)?;
+    let node = model.node_mut(resource.id)?;
+    if set_common_property(&mut node.common, key, value)? {
+        return Ok(None);
+    }
+    let mut callback_to_release = None;
+    match &mut node.kind {
+        NodeKind::Application { title, theme } => match key {
+            "名称" => *title = text(value)?.into(),
+            "主题" => *theme = text(value)?.into(),
+            _ => return Err("GUI_PROPERTY"),
+        },
+        NodeKind::Window(window) => match key {
+            "标题" => window.title = text(value)?.into(),
+            "最大化" => window.maximized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "最小化" => window.minimized = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "全屏" => window.fullscreen = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "置顶" => window.always_on_top = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "可缩放" => window.resizable = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "居中" => window.centered = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
+            "图标" => {
+                let Data::Bytes(bytes) = value else {
+                    return Err("GUI_VALUE_TYPE");
+                };
+                decode_image(bytes)?;
+                window.icon = Some(bytes.clone());
+            }
+            _ => return Err("GUI_PROPERTY"),
+        },
+        NodeKind::Layout(layout) => match key {
+            "间距" => layout.spacing = layout_value(value, 512.0)?,
+            "内边距" => layout.padding = layout_value(value, 127.0)?,
+            "伸缩" => {
+                if value.as_f64().ok_or("GUI_VALUE_TYPE")? != 0.0 {
+                    return Err("GUI_LAYOUT_FEATURE");
+                }
+                layout.grow = 0.0;
+            }
+            _ => return Err("GUI_PROPERTY"),
+        },
+        NodeKind::Control(control) => set_control_property(control, key, value)?,
+        NodeKind::Timer(timer) => match key {
+            "取消" => {
+                if !value.as_bool().ok_or("GUI_VALUE_TYPE")? {
+                    return Err("GUI_TIMER_STATE");
+                }
+                timer.cancelled = true;
+                callback_to_release = timer.callback.take();
+            }
+            _ => return Err("GUI_PROPERTY"),
+        },
+    }
+    Ok(callback_to_release)
 }
 
 fn set_control_property(
@@ -871,13 +1027,21 @@ fn set_control_property(
     match key {
         "文字" | "内容" => control.text = text(value)?.into(),
         "选中" => control.selected = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
-        "值" => control.value = value.as_f64().ok_or("GUI_VALUE_TYPE")?,
-        "当前项" => control.selected_index = value.as_u32().ok_or("GUI_VALUE_TYPE")? as usize,
+        "值" => {
+            let next = value.as_f64().ok_or("GUI_VALUE_TYPE")?;
+            validate_control_value(&control.kind, next)?;
+            control.value = next;
+        }
+        "当前项" => {
+            let next = value.as_u32().ok_or("GUI_VALUE_TYPE")? as usize;
+            validate_selected_index(&control.kind, next)?;
+            control.selected_index = next;
+        }
         "图片" => {
             let Data::Bytes(bytes) = value else {
                 return Err("GUI_VALUE_TYPE");
             };
-            image::load_from_memory(bytes).map_err(|_| "GUI_IMAGE")?;
+            decode_image(bytes)?;
             let ControlKind::Image { bytes: current, .. } = &mut control.kind else {
                 return Err("GUI_CONTROL_TYPE");
             };
@@ -911,7 +1075,7 @@ fn set_control_property(
 }
 
 fn get_property(resource: &GuiResource, key: &str) -> Result<Data, &'static str> {
-    let model = resource.model.lock().unwrap();
+    let model = lock_model(&resource.model)?;
     let node = model.node(resource.id)?;
     match key {
         "可见" => return Ok(Data::Bool(node.common.visible)),
@@ -981,7 +1145,7 @@ fn color(value: &Data) -> Result<[u8; 4], &'static str> {
             for (index, value) in values.iter().enumerate() {
                 color[index] = value
                     .as_f64()
-                    .filter(|value| (0.0..=255.0).contains(value))
+                    .filter(|value| value.fract() == 0.0 && (0.0..=255.0).contains(value))
                     .ok_or("GUI_COLOR")? as u8;
             }
             Ok(color)
@@ -1003,27 +1167,80 @@ fn parse_hex_color(value: &str) -> Result<[u8; 4], &'static str> {
     Ok(color)
 }
 
+fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage, &'static str> {
+    if bytes.is_empty() {
+        return Err("GUI_IMAGE");
+    }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| "GUI_IMAGE")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
+    reader.limits(limits);
+    reader.decode().map_err(|_| "GUI_IMAGE")
+}
+
+fn decoded_image_bytes(image: &image::DynamicImage) -> Result<usize, &'static str> {
+    usize::try_from(
+        u64::from(image.width())
+            .checked_mul(u64::from(image.height()))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("GUI_IMAGE")?,
+    )
+    .map_err(|_| "GUI_IMAGE")
+}
+
+fn append_canvas_command(
+    commands: &mut Vec<CanvasCommand>,
+    memory_bytes: &mut usize,
+    command: CanvasCommand,
+) -> Result<(), &'static str> {
+    if matches!(command, CanvasCommand::Clear(_)) {
+        commands.clear();
+        *memory_bytes = 0;
+    }
+    let next_memory = memory_bytes
+        .checked_add(command.memory_cost())
+        .ok_or("GUI_CANVAS_LIMIT")?;
+    if commands.len() >= MAX_CANVAS_COMMANDS || next_memory > MAX_CANVAS_MEMORY {
+        return Err("GUI_CANVAS_LIMIT");
+    }
+    commands.push(command);
+    *memory_bytes = next_memory;
+    Ok(())
+}
+
 fn dialog(kind: &str, config: &BTreeMap<String, Data>) -> Result<Data, &'static str> {
     let mut dialog = rfd::FileDialog::new();
-    if let Some(title) = map_text(config, "标题") {
+    if let Some(title) = map_text(config, "标题")? {
         dialog = dialog.set_title(title);
     }
-    if let Some(directory) = map_text(config, "目录") {
+    if let Some(directory) = map_text(config, "目录")? {
         dialog = dialog.set_directory(directory);
     }
-    if let Some(name) = map_text(config, "文件名") {
+    if let Some(name) = map_text(config, "文件名")? {
         dialog = dialog.set_file_name(name);
     }
-    if let Some(Data::Array(filters)) = config.get("过滤") {
-        for filter in filters {
-            let Data::Map(filter) = filter else {
-                return Err("GUI_DIALOG_FILTER");
-            };
-            let name = map_text(filter, "名称").ok_or("GUI_DIALOG_FILTER")?;
-            let extensions = map_strings(filter, "扩展名").ok_or("GUI_DIALOG_FILTER")?;
-            let refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
-            dialog = dialog.add_filter(name, &refs);
+    match config.get("过滤") {
+        None | Some(Data::Nil) => {}
+        Some(Data::Array(filters)) => {
+            for filter in filters {
+                let Data::Map(filter) = filter else {
+                    return Err("GUI_DIALOG_FILTER");
+                };
+                let name = map_text(filter, "名称")?
+                    .filter(|name| !name.is_empty())
+                    .ok_or("GUI_DIALOG_FILTER")?;
+                let extensions = map_strings(filter, "扩展名")?
+                    .filter(|extensions| !extensions.is_empty())
+                    .ok_or("GUI_DIALOG_FILTER")?;
+                let refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
+                dialog = dialog.add_filter(name, &refs);
+            }
         }
+        _ => return Err("GUI_VALUE_TYPE"),
     }
     Ok(match kind {
         "打开文件" => dialog.pick_file().map_or(Data::Nil, path_data),
@@ -1040,8 +1257,31 @@ fn path_data(path: std::path::PathBuf) -> Data {
     Data::String(path.to_string_lossy().into_owned())
 }
 
+fn canvas_value(value: &Data, minimum: f64, maximum: f64) -> Result<f32, &'static str> {
+    value
+        .as_f64()
+        .filter(|value| (minimum..=maximum).contains(value))
+        .map(|value| value as f32)
+        .ok_or("GUI_CANVAS_COMMAND")
+}
+
+fn canvas_number(
+    map: &BTreeMap<String, Data>,
+    key: &str,
+    default: Option<f64>,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f32, &'static str> {
+    let value = map_number(map, key)?
+        .or(default)
+        .ok_or("GUI_CANVAS_COMMAND")?;
+    ((minimum..=maximum).contains(&value))
+        .then_some(value as f32)
+        .ok_or("GUI_CANVAS_COMMAND")
+}
+
 fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'static str> {
-    let kind = map_text(map, "类型").ok_or("GUI_CANVAS_COMMAND")?;
+    let kind = map_text(map, "类型")?.ok_or("GUI_CANVAS_COMMAND")?;
     let point = |name: &str| -> Result<[f32; 2], &'static str> {
         let Data::Array(values) = map.get(name).ok_or("GUI_CANVAS_COMMAND")? else {
             return Err("GUI_CANVAS_COMMAND");
@@ -1050,8 +1290,8 @@ fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'stati
             return Err("GUI_CANVAS_COMMAND");
         }
         Ok([
-            values[0].as_f64().ok_or("GUI_CANVAS_COMMAND")? as f32,
-            values[1].as_f64().ok_or("GUI_CANVAS_COMMAND")? as f32,
+            canvas_value(&values[0], -1_000_000.0, 1_000_000.0)?,
+            canvas_value(&values[1], -1_000_000.0, 1_000_000.0)?,
         ])
     };
     let rgba = |name: &str, fallback: [u8; 4]| -> Result<[u8; 4], &'static str> {
@@ -1066,45 +1306,58 @@ fn canvas_command(map: &BTreeMap<String, Data>) -> Result<CanvasCommand, &'stati
             from: point("起点")?,
             to: point("终点")?,
             color: rgba("颜色", [255, 255, 255, 255])?,
-            width: map_number(map, "宽度").unwrap_or(1.0).clamp(0.1, 256.0) as f32,
+            width: canvas_number(map, "宽度", Some(1.0), 0.1, 256.0)?,
         }),
         "矩形" => Ok(CanvasCommand::Rectangle {
             minimum: point("起点")?,
             maximum: point("终点")?,
             color: rgba("颜色", [0, 0, 0, 0])?,
             stroke: rgba("边框颜色", [255, 255, 255, 255])?,
-            stroke_width: map_number(map, "边框宽度").unwrap_or(1.0) as f32,
-            radius: map_number(map, "圆角").unwrap_or(0.0) as f32,
+            stroke_width: canvas_number(map, "边框宽度", Some(1.0), 0.0, 256.0)?,
+            radius: canvas_number(map, "圆角", Some(0.0), 0.0, 4_096.0)?,
         }),
         "圆" => Ok(CanvasCommand::Circle {
             center: point("圆心")?,
-            radius: map_number(map, "半径").ok_or("GUI_CANVAS_COMMAND")? as f32,
+            radius: canvas_number(map, "半径", None, 0.0, 1_000_000.0)?,
             color: rgba("颜色", [0, 0, 0, 0])?,
             stroke: rgba("边框颜色", [255, 255, 255, 255])?,
-            stroke_width: map_number(map, "边框宽度").unwrap_or(1.0) as f32,
+            stroke_width: canvas_number(map, "边框宽度", Some(1.0), 0.0, 256.0)?,
         }),
         "文字" => Ok(CanvasCommand::Text {
             position: point("位置")?,
-            text: map_text(map, "文字").ok_or("GUI_CANVAS_COMMAND")?,
+            text: map_text(map, "文字")?.ok_or("GUI_CANVAS_COMMAND")?,
             color: rgba("颜色", [255, 255, 255, 255])?,
-            size: map_number(map, "字号").unwrap_or(14.0) as f32,
+            size: canvas_number(map, "字号", Some(14.0), 1.0, 1_024.0)?,
         }),
-        "图片" => Ok(CanvasCommand::Image {
-            minimum: point("起点")?,
-            maximum: point("终点")?,
-            bytes: match map.get("图片") {
-                Some(Data::Bytes(bytes)) => bytes.clone(),
-                _ => return Err("GUI_CANVAS_COMMAND"),
-            },
-        }),
+        "图片" => {
+            let Some(Data::Bytes(bytes)) = map.get("图片") else {
+                return Err("GUI_CANVAS_COMMAND");
+            };
+            let image = decode_image(bytes)?;
+            Ok(CanvasCommand::Image {
+                minimum: point("起点")?,
+                maximum: point("终点")?,
+                bytes: bytes.clone(),
+                decoded_bytes: decoded_image_bytes(&image)?,
+            })
+        }
         "裁剪" => Ok(CanvasCommand::Clip {
             minimum: point("起点")?,
             maximum: point("终点")?,
         }),
-        "变换" => Ok(CanvasCommand::Transform {
-            translation: point("平移")?,
-            scale: point("缩放")?,
-        }),
+        "变换" => {
+            let scale = point("缩放")?;
+            if scale
+                .iter()
+                .any(|value| !(0.001..=1_000.0).contains(&value.abs()))
+            {
+                return Err("GUI_CANVAS_COMMAND");
+            }
+            Ok(CanvasCommand::Transform {
+                translation: point("平移")?,
+                scale,
+            })
+        }
         _ => Err("GUI_CANVAS_COMMAND"),
     }
 }
@@ -1114,7 +1367,7 @@ fn run(model: Arc<Mutex<Model>>, host: HostApi) -> Result<(), &'static str> {
         return Err("GUI_PERMISSION");
     }
     let (title, viewport) = {
-        let model = model.lock().unwrap();
+        let model = lock_model(&model)?;
         let (title, window) = model
             .nodes
             .values()
@@ -1146,12 +1399,13 @@ fn run(model: Arc<Mutex<Model>>, host: HostApi) -> Result<(), &'static str> {
                 host,
                 root_window: None,
                 textures: HashMap::new(),
+                active_textures: HashSet::new(),
                 pending: Vec::new(),
                 fonts_loaded: false,
             }))
         }),
     );
-    let callbacks = run_model.lock().expect("GUI model poisoned").clear();
+    let callbacks = lock_model_for_cleanup(&run_model).clear();
     for callback in callbacks {
         host.release(callback);
     }
@@ -1163,11 +1417,24 @@ struct PendingEvent {
     event: Data,
 }
 
+fn deliver_pending(host: HostApi, pending: &mut Vec<PendingEvent>) {
+    let pending = std::mem::take(pending);
+    if pending.is_empty() {
+        let _ = host.pump();
+        return;
+    }
+    for event in pending {
+        let _ = host.post(event.callback, event.event);
+        let _ = host.pump();
+    }
+}
+
 struct DesktopApp {
     model: Arc<Mutex<Model>>,
     host: HostApi,
     root_window: Option<u64>,
     textures: HashMap<String, egui::TextureHandle>,
+    active_textures: HashSet<String>,
     pending: Vec<PendingEvent>,
     fonts_loaded: bool,
 }
@@ -1175,12 +1442,16 @@ struct DesktopApp {
 impl eframe::App for DesktopApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        self.active_textures.clear();
         if !self.fonts_loaded {
             self.install_system_fallback_fonts(&context);
             self.fonts_loaded = true;
         }
         let model_shared = self.model.clone();
-        let mut model = model_shared.lock().unwrap();
+        let Ok(mut model) = lock_model(&model_shared) else {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        };
         let theme = model.nodes.values().find_map(|node| match &node.kind {
             NodeKind::Application { theme, .. } => Some(theme.as_str()),
             _ => None,
@@ -1199,7 +1470,10 @@ impl eframe::App for DesktopApp {
             .filter(|node| matches!(node.kind, NodeKind::Window(_)) && node.common.visible)
             .map(|node| node.id)
             .collect::<Vec<_>>();
-        if self.root_window.is_none() {
+        if self
+            .root_window
+            .is_none_or(|root| !model.nodes.contains_key(&root))
+        {
             self.root_window = windows.first().copied();
         }
         if let Some(root) = self.root_window
@@ -1207,7 +1481,7 @@ impl eframe::App for DesktopApp {
         {
             self.apply_window_commands(&context, &model, root);
             self.collect_window_events(&context, &mut model, root);
-            self.handle_window_close(&context, &model, root);
+            self.handle_window_close(&context, &mut model, root);
             self.render_children(ui, &mut model, root);
         }
         for window_id in windows {
@@ -1236,10 +1510,12 @@ impl eframe::App for DesktopApp {
                 let viewport_context = ui.ctx().clone();
                 self.apply_window_commands(&viewport_context, &model, window_id);
                 self.collect_window_events(&viewport_context, &mut model, window_id);
-                self.handle_window_close(&viewport_context, &model, window_id);
+                self.handle_window_close(&viewport_context, &mut model, window_id);
                 self.render_children(ui, &mut model, window_id);
             });
         }
+        self.textures
+            .retain(|key, _| self.active_textures.contains(key));
         for (timer, callback) in model.due_timers(Instant::now()) {
             if let Ok(node) = model.node(timer) {
                 self.pending.push(PendingEvent {
@@ -1264,11 +1540,7 @@ impl eframe::App for DesktopApp {
             context.request_repaint();
         }
         drop(model);
-        let pending = std::mem::take(&mut self.pending);
-        for event in pending {
-            let _ = self.host.post(event.callback, event.event);
-        }
-        let _ = self.host.pump();
+        deliver_pending(self.host, &mut self.pending);
     }
 }
 
@@ -1357,7 +1629,7 @@ impl DesktopApp {
             )));
         }
         if let Some(bytes) = &window.icon
-            && let Ok(image) = image::load_from_memory(bytes)
+            && let Ok(image) = decode_image(bytes)
         {
             let image = image.to_rgba8();
             let width = image.width();
@@ -1372,18 +1644,17 @@ impl DesktopApp {
         }
     }
 
-    fn handle_window_close(&mut self, context: &egui::Context, model: &Model, id: u64) {
+    fn handle_window_close(&mut self, context: &egui::Context, model: &mut Model, id: u64) {
         if !context.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if let Ok(node) = model.node(id)
-            && let Some(callback) = node.events.get("关闭")
-        {
-            self.pending.push(PendingEvent {
-                callback: *callback,
-                event: event_data("窗口关闭", node, None),
-            });
+        let (event, callbacks) = prepare_window_close(model, id);
+        if let Some(event) = event {
+            self.pending.push(event);
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        for callback in callbacks {
+            self.host.release(callback);
         }
     }
 
@@ -1499,39 +1770,51 @@ impl DesktopApp {
         }
         match node.kind.clone() {
             NodeKind::Layout(layout) => {
-                ui.add_space(layout.padding);
-                match layout.kind {
-                    LayoutKind::Vertical => {
-                        ui.vertical(|ui| self.render_children(ui, model, id));
-                    }
-                    LayoutKind::Horizontal => {
-                        ui.horizontal(|ui| self.render_children(ui, model, id));
-                    }
-                    LayoutKind::Grid => {
-                        egui::Grid::new(("yanxu-grid", id))
-                            .num_columns(layout.columns)
-                            .spacing([layout.spacing, layout.spacing])
-                            .show(ui, |ui| {
-                                let children = model
-                                    .node(id)
-                                    .map(|node| node.children.clone())
-                                    .unwrap_or_default();
-                                for (index, child) in children.into_iter().enumerate() {
-                                    self.render_node(ui, model, child);
-                                    if (index + 1) % layout.columns == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    }
-                    LayoutKind::Stack => {
-                        ui.scope(|ui| self.render_children(ui, model, id));
-                    }
-                    LayoutKind::Scroll => {
-                        egui::ScrollArea::both().show(ui, |ui| self.render_children(ui, model, id));
-                    }
-                };
-                ui.add_space(layout.padding);
+                let horizontal =
+                    horizontal_alignment(&layout.horizontal_alignment).unwrap_or(egui::Align::Min);
+                let vertical =
+                    vertical_alignment(&layout.vertical_alignment).unwrap_or(egui::Align::Min);
+                egui::Frame::NONE
+                    .inner_margin(layout.padding)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(layout.spacing, layout.spacing);
+                        match layout.kind {
+                            LayoutKind::Vertical => {
+                                ui.with_layout(egui::Layout::top_down(horizontal), |ui| {
+                                    self.render_children(ui, model, id)
+                                });
+                            }
+                            LayoutKind::Horizontal => {
+                                ui.with_layout(egui::Layout::left_to_right(vertical), |ui| {
+                                    self.render_children(ui, model, id)
+                                });
+                            }
+                            LayoutKind::Grid => {
+                                egui::Grid::new(("yanxu-grid", id))
+                                    .num_columns(layout.columns)
+                                    .spacing([layout.spacing, layout.spacing])
+                                    .show(ui, |ui| {
+                                        let children = model
+                                            .node(id)
+                                            .map(|node| node.children.clone())
+                                            .unwrap_or_default();
+                                        for (index, child) in children.into_iter().enumerate() {
+                                            self.render_node(ui, model, child);
+                                            if (index + 1) % layout.columns == 0 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            }
+                            LayoutKind::Stack => {
+                                ui.scope(|ui| self.render_children(ui, model, id));
+                            }
+                            LayoutKind::Scroll => {
+                                egui::ScrollArea::both()
+                                    .show(ui, |ui| self.render_children(ui, model, id));
+                            }
+                        };
+                    });
             }
             NodeKind::Control(control) => self.render_control(ui, model, &node, control),
             _ => {}
@@ -1548,8 +1831,7 @@ impl DesktopApp {
         if control.margin > 0.0 {
             ui.add_space(control.margin);
         }
-        let width = node.common.width.unwrap_or_else(|| ui.available_width());
-        let height = node.common.height.unwrap_or(24.0);
+        let [width, height] = resolved_control_size(&node.common, ui.available_width());
         let response = ui
             .add_enabled_ui(node.common.enabled, |ui| {
                 ui.style_mut().override_font_id = Some(egui::FontId::new(
@@ -1560,6 +1842,7 @@ impl DesktopApp {
                         egui::FontFamily::Proportional
                     },
                 ));
+                ui.spacing_mut().button_padding = egui::Vec2::splat(control.padding.min(127.0));
                 if let Some(color) = control.text_color {
                     ui.visuals_mut().override_text_color = Some(color32(color));
                 }
@@ -1607,7 +1890,8 @@ impl DesktopApp {
                     }
                     ControlKind::Checkbox => ui.checkbox(&mut control.selected, &control.text),
                     ControlKind::Radio { group } => {
-                        let response = ui
+                        let previous = control.selected;
+                        let mut response = ui
                             .push_id(group.as_str(), |ui| {
                                 ui.radio(control.selected, &control.text)
                             })
@@ -1615,21 +1899,29 @@ impl DesktopApp {
                         if response.clicked() {
                             control.selected = true;
                         }
+                        if previous != control.selected {
+                            response.mark_changed();
+                        }
                         response
                     }
                     ControlKind::Select { options } => {
+                        let previous = control.selected_index;
                         let selected = options
                             .get(control.selected_index)
                             .cloned()
                             .unwrap_or_default();
-                        egui::ComboBox::from_id_salt(("yanxu-select", node.id))
+                        let mut response = egui::ComboBox::from_id_salt(("yanxu-select", node.id))
                             .selected_text(selected)
                             .show_ui(ui, |ui| {
                                 for (index, option) in options.iter().enumerate() {
                                     ui.selectable_value(&mut control.selected_index, index, option);
                                 }
                             })
-                            .response
+                            .response;
+                        if previous != control.selected_index {
+                            response.mark_changed();
+                        }
+                        response
                     }
                     ControlKind::Slider { minimum, maximum } => {
                         ui.add(egui::Slider::new(&mut control.value, *minimum..=*maximum))
@@ -1666,30 +1958,42 @@ impl DesktopApp {
                     }
                     ControlKind::Separator => ui.separator(),
                     ControlKind::Tabs { tabs } => {
-                        ui.horizontal(|ui| {
-                            for (index, tab) in tabs.iter().enumerate() {
-                                if ui
-                                    .selectable_label(index == control.selected_index, tab)
-                                    .clicked()
-                                {
-                                    control.selected_index = index;
+                        let previous = control.selected_index;
+                        let mut response = ui
+                            .horizontal(|ui| {
+                                for (index, tab) in tabs.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(index == control.selected_index, tab)
+                                        .clicked()
+                                    {
+                                        control.selected_index = index;
+                                    }
                                 }
-                            }
-                        })
-                        .response
+                            })
+                            .response;
+                        if previous != control.selected_index {
+                            response.mark_changed();
+                        }
+                        response
                     }
                     ControlKind::Menu { items } => {
-                        ui.menu_button(&control.text, |ui| {
-                            for (index, item) in items.iter().enumerate() {
-                                if ui.button(item).clicked() {
-                                    control.selected_index = index;
-                                    ui.close();
+                        let previous = control.selected_index;
+                        let mut response = ui
+                            .menu_button(&control.text, |ui| {
+                                for (index, item) in items.iter().enumerate() {
+                                    if ui.button(item).clicked() {
+                                        control.selected_index = index;
+                                        ui.close();
+                                    }
                                 }
-                            }
-                        })
-                        .response
+                            })
+                            .response;
+                        if previous != control.selected_index {
+                            response.mark_changed();
+                        }
+                        response
                     }
-                    ControlKind::Canvas { commands } => {
+                    ControlKind::Canvas { commands, .. } => {
                         self.render_canvas(ui, node.id, commands, width, height)
                     }
                 }
@@ -1780,9 +2084,12 @@ impl DesktopApp {
         preserve_ratio: bool,
     ) -> egui::Response {
         let key = format!("image-{id}-{:x}", Sha256::digest(bytes));
+        if !bytes.is_empty() {
+            self.active_textures.insert(key.clone());
+        }
         if !bytes.is_empty()
             && !self.textures.contains_key(&key)
-            && let Ok(image) = image::load_from_memory(bytes)
+            && let Ok(image) = decode_image(bytes)
         {
             let image = image.to_rgba8();
             let size = [image.width() as usize, image.height() as usize];
@@ -1886,10 +2193,12 @@ impl DesktopApp {
                     minimum,
                     maximum,
                     bytes,
+                    ..
                 } => {
                     let key = format!("canvas-{id}-{index}-{:x}", Sha256::digest(bytes));
+                    self.active_textures.insert(key.clone());
                     if !self.textures.contains_key(&key)
-                        && let Ok(image) = image::load_from_memory(bytes)
+                        && let Ok(image) = decode_image(bytes)
                     {
                         let image = image.to_rgba8();
                         let size = [image.width() as usize, image.height() as usize];
@@ -2025,6 +2334,39 @@ impl DesktopApp {
     }
 }
 
+fn prepare_window_close(model: &mut Model, id: u64) -> (Option<PendingEvent>, Vec<u64>) {
+    let Ok(node) = model.node(id) else {
+        return (None, Vec::new());
+    };
+    if let Some(callback) = node.events.get("关闭") {
+        return (
+            Some(PendingEvent {
+                callback: *callback,
+                event: event_data("窗口关闭", node, None),
+            }),
+            Vec::new(),
+        );
+    }
+    (None, model.remove(id))
+}
+
+fn resolved_control_size(common: &Common, available_width: f32) -> [f32; 2] {
+    let minimum_width = common.minimum_width.unwrap_or(1.0);
+    let maximum_width = common.maximum_width.unwrap_or(16_384.0);
+    let minimum_height = common.minimum_height.unwrap_or(1.0);
+    let maximum_height = common.maximum_height.unwrap_or(16_384.0);
+    [
+        common
+            .width
+            .unwrap_or(available_width.max(1.0))
+            .clamp(minimum_width, maximum_width),
+        common
+            .height
+            .unwrap_or(24.0)
+            .clamp(minimum_height, maximum_height),
+    ]
+}
+
 fn pointer_event(context: &egui::Context) -> Option<Data> {
     context
         .input(|input| input.pointer.hover_pos())
@@ -2086,9 +2428,68 @@ fn event_data(kind: &str, node: &Node, details: Option<Data>) -> Data {
     Data::Map(event)
 }
 
+fn custom_event_data(kind: &str, node: &Node, payload: Data) -> Data {
+    event_data(
+        kind,
+        node,
+        Some(Data::Map(BTreeMap::from([("详情".into(), payload)]))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct DeliveryTrace {
+        steps: Vec<String>,
+    }
+
+    unsafe extern "C" fn trace_post(
+        context: *mut c_void,
+        callback: u64,
+        _arguments: *const crate::abi::Value,
+        _count: usize,
+        _error: *mut NativeError,
+    ) -> i32 {
+        let trace = unsafe { &mut *context.cast::<DeliveryTrace>() };
+        trace.steps.push(format!("post:{callback}"));
+        abi::OK
+    }
+
+    unsafe extern "C" fn trace_pump(
+        context: *mut c_void,
+        _maximum_events: usize,
+        _error: *mut NativeError,
+    ) -> i32 {
+        let trace = unsafe { &mut *context.cast::<DeliveryTrace>() };
+        trace.steps.push("pump".into());
+        abi::OK
+    }
+
+    struct TimerHostTrace {
+        resource: *mut c_void,
+        released: Vec<u64>,
+    }
+
+    unsafe extern "C" fn trace_release(context: *mut c_void, callback: u64) -> i32 {
+        let trace = unsafe { &mut *context.cast::<TimerHostTrace>() };
+        trace.released.push(callback);
+        abi::OK
+    }
+
+    unsafe extern "C" fn trace_resource_get(
+        context: *mut c_void,
+        _handle: u64,
+        output: *mut *mut c_void,
+    ) -> i32 {
+        let trace = unsafe { &*context.cast::<TimerHostTrace>() };
+        if output.is_null() || trace.resource.is_null() {
+            return abi::ERROR;
+        }
+        unsafe { *output = trace.resource };
+        abi::OK
+    }
 
     fn string_array(values: &[&str]) -> Data {
         Data::Array(
@@ -2205,6 +2606,271 @@ mod tests {
         }
         assert_eq!(event["目标"], Data::Integer(99));
         assert_eq!(event["横坐标"], Data::Number(12.5));
+
+        let payload = Data::Map(BTreeMap::from([
+            ("类型".into(), Data::String("伪造类型".into())),
+            ("目标".into(), Data::Integer(-1)),
+        ]));
+        let Data::Map(custom) = custom_event_data("业务事件", &node, payload.clone()) else {
+            panic!("custom event must be a map");
+        };
+        assert_eq!(custom["类型"], Data::String("业务事件".into()));
+        assert_eq!(custom["目标"], Data::Integer(99));
+        assert_eq!(custom["详情"], payload);
+        assert_eq!(
+            event_name(&Data::String(String::new())),
+            Err("GUI_EVENT_NAME")
+        );
+        assert_eq!(
+            event_name(&Data::String("x".repeat(257))),
+            Err("GUI_EVENT_NAME")
+        );
+    }
+
+    #[test]
+    fn window_close_removes_unhandled_subtrees_but_defers_handled_windows() {
+        let mut model = Model::default();
+        let app = model
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create application");
+        let unhandled = model
+            .create(Some(app), NodeKind::Window(WindowState::default()))
+            .expect("create unhandled window");
+        let child = model
+            .create(
+                Some(unhandled),
+                NodeKind::Control(ControlState::new(ControlKind::Button)),
+            )
+            .expect("create child");
+        model
+            .bind_event(child, "点击".into(), 5)
+            .expect("bind child event");
+
+        let (event, callbacks) = prepare_window_close(&mut model, unhandled);
+        assert!(event.is_none());
+        assert_eq!(callbacks, [5]);
+        assert!(model.node(unhandled).is_err());
+        assert!(model.node(child).is_err());
+
+        let handled = model
+            .create(Some(app), NodeKind::Window(WindowState::default()))
+            .expect("create handled window");
+        model
+            .bind_event(handled, "关闭".into(), 7)
+            .expect("bind close event");
+        let (event, callbacks) = prepare_window_close(&mut model, handled);
+        let event = event.expect("handled close produces an event");
+        assert_eq!(event.callback, 7);
+        let Data::Map(data) = event.event else {
+            panic!("close event must be a map");
+        };
+        assert_eq!(data["类型"], Data::String("窗口关闭".into()));
+        assert!(callbacks.is_empty());
+        assert!(model.node(handled).is_ok());
+    }
+
+    #[test]
+    fn pending_events_are_pumped_before_the_next_callback_is_posted() {
+        let mut trace = DeliveryTrace::default();
+        let host = HostApi(NativeHost {
+            abi_version: abi::ABI,
+            struct_size: std::mem::size_of::<NativeHost>(),
+            context: (&raw mut trace).cast(),
+            callback_retain: None,
+            callback_release: None,
+            callback_post: Some(trace_post),
+            wake: None,
+            pump: Some(trace_pump),
+            has_permission: None,
+            resource_get: None,
+            event_loop_id: 1,
+            owner_thread_token: 1,
+        });
+        let mut pending = vec![
+            PendingEvent {
+                callback: 10,
+                event: Data::Nil,
+            },
+            PendingEvent {
+                callback: 20,
+                event: Data::Nil,
+            },
+        ];
+
+        deliver_pending(host, &mut pending);
+
+        assert!(pending.is_empty());
+        assert_eq!(trace.steps, ["post:10", "pump", "post:20", "pump"]);
+        deliver_pending(host, &mut pending);
+        assert_eq!(trace.steps.last().map(String::as_str), Some("pump"));
+    }
+
+    #[test]
+    fn cancelling_a_timer_releases_its_retained_callback_exactly_once() {
+        let model = Arc::new(Mutex::new(Model::default()));
+        let (app, timer) = {
+            let mut model = model.lock().expect("fresh model");
+            let app = model
+                .create(
+                    None,
+                    NodeKind::Application {
+                        title: "测试".into(),
+                        theme: "系统".into(),
+                    },
+                )
+                .expect("create application");
+            let timer = model
+                .create(
+                    Some(app),
+                    NodeKind::Timer(TimerState {
+                        interval: Duration::from_millis(10),
+                        repeating: true,
+                        next: Instant::now() + Duration::from_secs(1),
+                        callback: Some(42),
+                        cancelled: false,
+                    }),
+                )
+                .expect("create timer");
+            (app, timer)
+        };
+        let mut trace = TimerHostTrace {
+            resource: std::ptr::null_mut(),
+            released: Vec::new(),
+        };
+        let host = HostApi(NativeHost {
+            abi_version: abi::ABI,
+            struct_size: std::mem::size_of::<NativeHost>(),
+            context: (&raw mut trace).cast(),
+            callback_retain: None,
+            callback_release: Some(trace_release),
+            callback_post: None,
+            wake: None,
+            pump: None,
+            has_permission: None,
+            resource_get: Some(trace_resource_get),
+            event_loop_id: 1,
+            owner_thread_token: 1,
+        });
+        let mut resource = GuiResource {
+            model: Arc::clone(&model),
+            kind: ResourceKind::Timer,
+            id: timer,
+            host,
+            cleaned: AtomicBool::new(false),
+        };
+        trace.resource = (&raw mut resource).cast();
+        let arguments = [
+            Data::Resource(7),
+            Data::String("取消".into()),
+            Data::Bool(true),
+        ];
+
+        let mut wrong_thread_table = host.0;
+        wrong_thread_table.owner_thread_token = 2;
+        assert!(matches!(
+            unsafe {
+                call(
+                    Operation::GetProperty,
+                    &[Data::Resource(7), Data::String("已取消".into())],
+                    HostApi(wrong_thread_table),
+                )
+            },
+            Err("GUI_RESOURCE_THREAD")
+        ));
+
+        assert!(matches!(
+            unsafe { call(Operation::SetProperty, &arguments, host) },
+            Ok(Output::Value(Data::Nil))
+        ));
+        assert!(matches!(
+            unsafe { call(Operation::SetProperty, &arguments, host) },
+            Ok(Output::Value(Data::Nil))
+        ));
+
+        assert_eq!(trace.released, [42]);
+        let model = lock_model(&model).expect("model remains healthy");
+        let NodeKind::Timer(timer_state) =
+            &model.node(timer).expect("timer remains queryable").kind
+        else {
+            panic!("expected timer node");
+        };
+        assert!(timer_state.cancelled);
+        assert_eq!(timer_state.callback, None);
+        assert_eq!(
+            model.node(app).expect("application remains live").children,
+            [timer]
+        );
+        drop(model);
+        resource.cleanup();
+        assert!(matches!(
+            unsafe {
+                call(
+                    Operation::GetProperty,
+                    &[Data::Resource(7), Data::String("已取消".into())],
+                    host,
+                )
+            },
+            Err("GUI_RESOURCE_CLOSED")
+        ));
+    }
+
+    #[test]
+    fn poisoned_models_fail_calls_but_still_allow_idempotent_cleanup() {
+        let model = Arc::new(Mutex::new(Model::default()));
+        let id = model
+            .lock()
+            .expect("fresh model")
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create application");
+        let poisoned = Arc::clone(&model);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.lock().expect("fresh model");
+            panic!("poison model for cleanup test");
+        }));
+        assert!(panic.is_err());
+
+        let resource = GuiResource {
+            model: Arc::clone(&model),
+            kind: ResourceKind::Application,
+            id,
+            host: HostApi(NativeHost {
+                abi_version: abi::ABI,
+                struct_size: std::mem::size_of::<NativeHost>(),
+                context: std::ptr::null_mut(),
+                callback_retain: None,
+                callback_release: None,
+                callback_post: None,
+                wake: None,
+                pump: None,
+                has_permission: None,
+                resource_get: None,
+                event_loop_id: 1,
+                owner_thread_token: 1,
+            }),
+            cleaned: AtomicBool::new(false),
+        };
+
+        assert_eq!(
+            set_property(&resource, "名称", &Data::String("新名称".into())),
+            Err("GUI_BACKEND_STATE")
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resource.cleanup())).is_ok()
+        );
+        assert!(lock_model_for_cleanup(&model).node(id).is_err());
+        resource.cleanup();
     }
 
     #[test]
@@ -2220,5 +2886,184 @@ mod tests {
         assert!(parse_hex_color("not-a-color").is_err());
         assert!(canvas_command(&BTreeMap::new()).is_err());
         assert!(create_control("不存在", &BTreeMap::new()).is_err());
+
+        assert_eq!(
+            apply_window_config(
+                &mut WindowState::default(),
+                &BTreeMap::from([("标题".into(), Data::Integer(1))])
+            ),
+            Err("GUI_VALUE_TYPE")
+        );
+        assert_eq!(
+            apply_layout_config(
+                &mut LayoutState::new(LayoutKind::Grid),
+                &BTreeMap::from([("列数".into(), Data::String("二".into()))])
+            ),
+            Err("GUI_VALUE_TYPE")
+        );
+        assert_eq!(
+            apply_layout_config(
+                &mut LayoutState::new(LayoutKind::Vertical),
+                &BTreeMap::from([("水平对齐".into(), Data::String("未知".into()))])
+            ),
+            Err("GUI_LAYOUT_ALIGN")
+        );
+        assert_eq!(
+            apply_layout_config(
+                &mut LayoutState::new(LayoutKind::Vertical),
+                &BTreeMap::from([("伸缩".into(), Data::Integer(1))])
+            ),
+            Err("GUI_LAYOUT_FEATURE")
+        );
+        assert!(matches!(
+            create_control(
+                "输入框",
+                &BTreeMap::from([("占位".into(), Data::Bool(true))])
+            ),
+            Err("GUI_VALUE_TYPE")
+        ));
+        assert!(matches!(
+            canvas_command(&BTreeMap::from([("类型".into(), Data::Integer(1))])),
+            Err("GUI_VALUE_TYPE")
+        ));
+        assert_eq!(
+            color(&Data::Array(vec![
+                Data::Number(1.5),
+                Data::Integer(2),
+                Data::Integer(3),
+            ])),
+            Err("GUI_COLOR")
+        );
+        assert!(
+            canvas_command(&BTreeMap::from([
+                ("类型".into(), Data::String("线段".into())),
+                (
+                    "起点".into(),
+                    Data::Array(vec![Data::Number(1.0e20), Data::Integer(0)])
+                ),
+                (
+                    "终点".into(),
+                    Data::Array(vec![Data::Integer(1), Data::Integer(1)])
+                ),
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn image_decoding_and_canvas_storage_have_hard_limits() {
+        use image::ImageEncoder;
+
+        let decoded = decode_image(include_bytes!("../../examples/assets/言序.png"))
+            .expect("bundled PNG is valid");
+        assert_eq!((decoded.width(), decoded.height()), (512, 512));
+
+        let width = MAX_IMAGE_DIMENSION + 1;
+        let mut oversized = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut oversized)
+            .write_image(
+                &vec![0_u8; width as usize * 4],
+                width,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("encode oversized fixture");
+        assert!(matches!(decode_image(&oversized), Err("GUI_IMAGE")));
+
+        let line = || CanvasCommand::Line {
+            from: [0.0, 0.0],
+            to: [1.0, 1.0],
+            color: [0, 0, 0, 255],
+            width: 1.0,
+        };
+        let mut commands = Vec::new();
+        let mut memory_bytes = 0;
+        for _ in 0..MAX_CANVAS_COMMANDS {
+            append_canvas_command(&mut commands, &mut memory_bytes, line())
+                .expect("command count within limit");
+        }
+        assert_eq!(
+            append_canvas_command(&mut commands, &mut memory_bytes, line()),
+            Err("GUI_CANVAS_LIMIT")
+        );
+        append_canvas_command(
+            &mut commands,
+            &mut memory_bytes,
+            CanvasCommand::Clear([0, 0, 0, 0]),
+        )
+        .expect("clear resets command budget");
+        assert_eq!(commands.len(), 1);
+
+        commands.clear();
+        memory_bytes = MAX_CANVAS_MEMORY - line().memory_cost();
+        append_canvas_command(&mut commands, &mut memory_bytes, line())
+            .expect("memory boundary is inclusive");
+        assert_eq!(memory_bytes, MAX_CANVAS_MEMORY);
+        assert_eq!(
+            append_canvas_command(&mut commands, &mut memory_bytes, line()),
+            Err("GUI_CANVAS_LIMIT")
+        );
+    }
+
+    #[test]
+    fn control_ranges_and_size_constraints_are_enforced_before_commit() {
+        assert!(matches!(
+            create_control(
+                "滑块",
+                &BTreeMap::from([
+                    ("最小值".into(), Data::Integer(10)),
+                    ("最大值".into(), Data::Integer(5)),
+                ])
+            ),
+            Err("GUI_CONTROL_RANGE")
+        ));
+
+        let mut slider = create_control(
+            "滑块",
+            &BTreeMap::from([
+                ("最小值".into(), Data::Integer(0)),
+                ("最大值".into(), Data::Integer(10)),
+            ]),
+        )
+        .expect("valid slider");
+        apply_control_config(
+            &mut slider,
+            &BTreeMap::from([("值".into(), Data::Integer(5))]),
+        )
+        .expect("value inside slider range");
+        assert_eq!(
+            set_control_property(&mut slider, "值", &Data::Integer(11)),
+            Err("GUI_CONTROL_RANGE")
+        );
+        assert_eq!(slider.value, 5.0);
+
+        let mut select = create_control(
+            "下拉选择",
+            &BTreeMap::from([("选项".into(), string_array(&["甲", "乙"]))]),
+        )
+        .expect("valid select");
+        assert_eq!(
+            set_control_property(&mut select, "当前项", &Data::Integer(2)),
+            Err("GUI_CONTROL_RANGE")
+        );
+        assert_eq!(select.selected_index, 0);
+
+        let mut common = Common::default();
+        assert_eq!(
+            set_common_property(&mut common, "宽", &Data::Integer(100)),
+            Ok(true)
+        );
+        assert_eq!(
+            set_common_property(&mut common, "最小宽", &Data::Integer(120)),
+            Err("GUI_SIZE_RANGE")
+        );
+        assert_eq!(common.minimum_width, None);
+        assert_eq!(resolved_control_size(&common, 20.0), [100.0, 24.0]);
+
+        common.width = None;
+        common.minimum_width = Some(80.0);
+        common.maximum_width = Some(120.0);
+        assert_eq!(resolved_control_size(&common, 20.0), [80.0, 24.0]);
+        assert_eq!(resolved_control_size(&common, 200.0), [120.0, 24.0]);
     }
 }

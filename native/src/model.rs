@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+const MAX_EVENTS_PER_NODE: usize = 128;
+const MAX_MODEL_NODES: usize = 65_536;
+const MAX_MODEL_DEPTH: usize = 256;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Data {
     Nil,
@@ -210,6 +214,7 @@ pub enum CanvasCommand {
         minimum: [f32; 2],
         maximum: [f32; 2],
         bytes: Vec<u8>,
+        decoded_bytes: usize,
     },
     Clip {
         minimum: [f32; 2],
@@ -219,6 +224,22 @@ pub enum CanvasCommand {
         translation: [f32; 2],
         scale: [f32; 2],
     },
+}
+
+impl CanvasCommand {
+    pub fn memory_cost(&self) -> usize {
+        const COMMAND_OVERHEAD: usize = 128;
+        let payload = match self {
+            Self::Text { text, .. } => text.len(),
+            Self::Image {
+                bytes,
+                decoded_bytes,
+                ..
+            } => bytes.len().saturating_add(*decoded_bytes),
+            _ => 0,
+        };
+        COMMAND_OVERHEAD.saturating_add(payload)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +278,7 @@ pub enum ControlKind {
     },
     Canvas {
         commands: Vec<CanvasCommand>,
+        memory_bytes: usize,
     },
 }
 
@@ -306,7 +328,7 @@ pub struct TimerState {
     pub interval: Duration,
     pub repeating: bool,
     pub next: Instant,
-    pub callback: u64,
+    pub callback: Option<u64>,
     pub cancelled: bool,
 }
 
@@ -341,10 +363,23 @@ pub struct Model {
 
 impl Model {
     pub fn create(&mut self, parent: Option<u64>, kind: NodeKind) -> Result<u64, &'static str> {
+        if self.nodes.len() >= MAX_MODEL_NODES {
+            return Err("GUI_RESOURCE_LIMIT");
+        }
         if let Some(parent) = parent
             && !self.nodes.contains_key(&parent)
         {
             return Err("GUI_RESOURCE_CLOSED");
+        }
+        let mut ancestor = parent;
+        let mut parent_depth = 0;
+        while let Some(id) = ancestor {
+            let node = self.nodes.get(&id).ok_or("GUI_RESOURCE_CLOSED")?;
+            parent_depth += 1;
+            if parent_depth >= MAX_MODEL_DEPTH {
+                return Err("GUI_RESOURCE_LIMIT");
+            }
+            ancestor = node.parent;
         }
         self.next_id = self.next_id.checked_add(1).ok_or("GUI_RESOURCE_LIMIT")?;
         let id = self.next_id;
@@ -388,7 +423,11 @@ impl Model {
         event: String,
         callback: u64,
     ) -> Result<Option<u64>, &'static str> {
-        Ok(self.node_mut(id)?.events.insert(event, callback))
+        let node = self.node_mut(id)?;
+        if !node.events.contains_key(&event) && node.events.len() >= MAX_EVENTS_PER_NODE {
+            return Err("GUI_EVENT_LIMIT");
+        }
+        Ok(node.events.insert(event, callback))
     }
 
     pub fn remove(&mut self, id: u64) -> Vec<u64> {
@@ -412,7 +451,7 @@ impl Model {
         }
         callbacks.extend(node.events.into_values());
         match node.kind {
-            NodeKind::Timer(timer) => callbacks.push(timer.callback),
+            NodeKind::Timer(timer) => callbacks.extend(timer.callback),
             NodeKind::Application { .. } => self.exit_requested = true,
             _ => {}
         }
@@ -430,7 +469,7 @@ impl Model {
         for (_, node) in std::mem::take(&mut self.nodes) {
             callbacks.extend(node.events.into_values());
             if let NodeKind::Timer(timer) = node.kind {
-                callbacks.push(timer.callback);
+                callbacks.extend(timer.callback);
             }
         }
         self.roots.clear();
@@ -448,7 +487,10 @@ impl Model {
             if timer.cancelled || timer.next > now {
                 continue;
             }
-            due.push((node.id, timer.callback));
+            let Some(callback) = timer.callback else {
+                continue;
+            };
+            due.push((node.id, callback));
             if timer.repeating {
                 while timer.next <= now {
                     timer.next += timer.interval;
@@ -533,7 +575,7 @@ mod tests {
             .create(
                 Some(app),
                 NodeKind::Timer(TimerState {
-                    callback: 11,
+                    callback: Some(11),
                     interval: Duration::from_millis(5),
                     next: Instant::now(),
                     repeating: true,
@@ -587,5 +629,81 @@ mod tests {
         assert!(model.node(app).is_ok());
         assert!(model.node(app).unwrap().children.is_empty());
         assert!(model.remove(window).is_empty());
+    }
+
+    #[test]
+    fn event_bindings_are_bounded_but_existing_names_can_be_replaced() {
+        let mut model = Model::default();
+        let app = model
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create application");
+        for index in 0..MAX_EVENTS_PER_NODE {
+            assert_eq!(
+                model.bind_event(app, format!("事件{index}"), index as u64),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            model.bind_event(app, "超额事件".into(), 999),
+            Err("GUI_EVENT_LIMIT")
+        );
+        assert_eq!(model.bind_event(app, "事件0".into(), 1000), Ok(Some(0)));
+    }
+
+    #[test]
+    fn model_node_count_and_tree_depth_have_hard_limits() {
+        let mut deep = Model::default();
+        let mut parent = deep
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create root");
+        for _ in 1..MAX_MODEL_DEPTH {
+            parent = deep
+                .create(
+                    Some(parent),
+                    NodeKind::Layout(LayoutState::new(LayoutKind::Vertical)),
+                )
+                .expect("depth within limit");
+        }
+        assert_eq!(
+            deep.create(
+                Some(parent),
+                NodeKind::Layout(LayoutState::new(LayoutKind::Vertical))
+            ),
+            Err("GUI_RESOURCE_LIMIT")
+        );
+
+        let mut wide = Model::default();
+        for _ in 0..MAX_MODEL_NODES {
+            wide.create(
+                None,
+                NodeKind::Application {
+                    title: String::new(),
+                    theme: String::new(),
+                },
+            )
+            .expect("node count within limit");
+        }
+        assert_eq!(
+            wide.create(
+                None,
+                NodeKind::Application {
+                    title: String::new(),
+                    theme: String::new(),
+                }
+            ),
+            Err("GUI_RESOURCE_LIMIT")
+        );
     }
 }

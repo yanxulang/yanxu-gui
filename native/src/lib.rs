@@ -16,6 +16,12 @@ static ERROR_MESSAGE: &[u8] = b"yanxu-gui rejected the operation";
 static PANIC_CODE: &[u8] = b"GUI_BACKEND_PANIC";
 static PANIC_MESSAGE: &[u8] = b"panic isolated inside yanxu-gui backend";
 
+#[repr(C)]
+struct NativeHostPrefix {
+    abi_version: u32,
+    struct_size: usize,
+}
+
 static FUNCTIONS: &[(&[u8], Operation)] = &[
     ("应用创建".as_bytes(), Operation::CreateApplication),
     ("窗口创建".as_bytes(), Operation::CreateWindow),
@@ -102,15 +108,18 @@ unsafe extern "C" fn dispatch(
     output: *mut Value,
     error: *mut NativeError,
 ) -> i32 {
-    if output.is_null() || host.is_null() {
+    if output.is_null() {
         return fail(error, "GUI_HOST_ABI");
     }
+    let host = match unsafe { read_host(host) } {
+        Ok(host) => host,
+        Err(code) => return fail(error, code),
+    };
     let Some(operation) = Operation::from_context(context) else {
         return fail(error, "GUI_FUNCTION");
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let arguments = unsafe { bridge::decode_arguments(arguments, count) }?;
-        let host = HostApi(unsafe { *host });
         unsafe { backend::call(operation, &arguments, host) }
     }));
     match result {
@@ -154,6 +163,14 @@ unsafe extern "C" fn dispatch(
     }
 }
 
+unsafe fn read_host(host: *const NativeHost) -> Result<HostApi, &'static str> {
+    let prefix = unsafe { host.cast::<NativeHostPrefix>().as_ref() }.ok_or("GUI_HOST_ABI")?;
+    if prefix.abi_version != ABI || prefix.struct_size < std::mem::size_of::<NativeHost>() {
+        return Err("GUI_HOST_ABI");
+    }
+    Ok(HostApi(unsafe { host.read() }))
+}
+
 fn fail(error: *mut NativeError, code: &'static str) -> i32 {
     if let Some(error) = unsafe { error.as_mut() } {
         *error = NativeError {
@@ -164,4 +181,40 @@ fn fail(error: *mut NativeError, code: &'static str) -> i32 {
         };
     }
     ERROR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_table_is_not_read_past_an_undersized_prefix() {
+        let prefix = NativeHostPrefix {
+            abi_version: ABI,
+            struct_size: std::mem::size_of::<NativeHostPrefix>(),
+        };
+        let host = (&raw const prefix).cast::<NativeHost>();
+
+        assert!(matches!(unsafe { read_host(host) }, Err("GUI_HOST_ABI")));
+    }
+
+    #[test]
+    fn complete_matching_host_table_is_accepted() {
+        let host = NativeHost {
+            abi_version: ABI,
+            struct_size: std::mem::size_of::<NativeHost>(),
+            context: ptr::null_mut(),
+            callback_retain: None,
+            callback_release: None,
+            callback_post: None,
+            wake: None,
+            pump: None,
+            has_permission: None,
+            resource_get: None,
+            event_loop_id: 1,
+            owner_thread_token: 1,
+        };
+
+        assert!(unsafe { read_host(&raw const host) }.is_ok());
+    }
 }
