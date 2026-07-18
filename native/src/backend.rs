@@ -310,7 +310,7 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            let event = text(&arguments[1])?.to_owned();
+            let event = event_name(&arguments[1])?.to_owned();
             let callback = callback(&arguments[2])?;
             host.retain(callback)?;
             let result = lock_model(&resource.model)
@@ -500,12 +500,12 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            let event = text(&arguments[1])?;
+            let event = event_name(&arguments[1])?;
             let node = lock_model(&resource.model)?.node(resource.id)?.clone();
             if let Some(callback) = node.events.get(event) {
                 host.post(
                     *callback,
-                    event_data(event, &node, Some(arguments[2].clone())),
+                    custom_event_data(event, &node, arguments[2].clone()),
                 )?;
                 host.pump()?;
             }
@@ -588,6 +588,13 @@ fn require_count(arguments: &[Data], expected: usize) -> Result<(), &'static str
 
 fn text(value: &Data) -> Result<&str, &'static str> {
     value.as_text().ok_or("GUI_VALUE_TYPE")
+}
+
+fn event_name(value: &Data) -> Result<&str, &'static str> {
+    let event = text(value)?;
+    (!event.is_empty() && event.len() <= 256)
+        .then_some(event)
+        .ok_or("GUI_EVENT_NAME")
 }
 
 fn map(value: &Data) -> Result<&BTreeMap<String, Data>, &'static str> {
@@ -2097,6 +2104,14 @@ fn event_data(kind: &str, node: &Node, details: Option<Data>) -> Data {
     Data::Map(event)
 }
 
+fn custom_event_data(kind: &str, node: &Node, payload: Data) -> Data {
+    event_data(
+        kind,
+        node,
+        Some(Data::Map(BTreeMap::from([("详情".into(), payload)]))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2267,6 +2282,25 @@ mod tests {
         }
         assert_eq!(event["目标"], Data::Integer(99));
         assert_eq!(event["横坐标"], Data::Number(12.5));
+
+        let payload = Data::Map(BTreeMap::from([
+            ("类型".into(), Data::String("伪造类型".into())),
+            ("目标".into(), Data::Integer(-1)),
+        ]));
+        let Data::Map(custom) = custom_event_data("业务事件", &node, payload.clone()) else {
+            panic!("custom event must be a map");
+        };
+        assert_eq!(custom["类型"], Data::String("业务事件".into()));
+        assert_eq!(custom["目标"], Data::Integer(99));
+        assert_eq!(custom["详情"], payload);
+        assert_eq!(
+            event_name(&Data::String(String::new())),
+            Err("GUI_EVENT_NAME")
+        );
+        assert_eq!(
+            event_name(&Data::String("x".repeat(257))),
+            Err("GUI_EVENT_NAME")
+        );
     }
 
     #[test]

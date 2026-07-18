@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+const MAX_EVENTS_PER_NODE: usize = 128;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Data {
     Nil,
@@ -388,7 +390,11 @@ impl Model {
         event: String,
         callback: u64,
     ) -> Result<Option<u64>, &'static str> {
-        Ok(self.node_mut(id)?.events.insert(event, callback))
+        let node = self.node_mut(id)?;
+        if !node.events.contains_key(&event) && node.events.len() >= MAX_EVENTS_PER_NODE {
+            return Err("GUI_EVENT_LIMIT");
+        }
+        Ok(node.events.insert(event, callback))
     }
 
     pub fn remove(&mut self, id: u64) -> Vec<u64> {
@@ -590,5 +596,30 @@ mod tests {
         assert!(model.node(app).is_ok());
         assert!(model.node(app).unwrap().children.is_empty());
         assert!(model.remove(window).is_empty());
+    }
+
+    #[test]
+    fn event_bindings_are_bounded_but_existing_names_can_be_replaced() {
+        let mut model = Model::default();
+        let app = model
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create application");
+        for index in 0..MAX_EVENTS_PER_NODE {
+            assert_eq!(
+                model.bind_event(app, format!("事件{index}"), index as u64),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            model.bind_event(app, "超额事件".into(), 999),
+            Err("GUI_EVENT_LIMIT")
+        );
+        assert_eq!(model.bind_event(app, "事件0".into(), 1000), Ok(Some(0)));
     }
 }
