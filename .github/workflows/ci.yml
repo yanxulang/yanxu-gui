@@ -65,6 +65,7 @@ jobs:
           set -euo pipefail
           for file in README.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md \
             COMPATIBILITY.md SECURITY.md CONTRIBUTING.md 言序.toml.in \
+            .cargo/config.toml \
             api/api-v1.json docs/API.md docs/GUIDE.md docs/ARCHITECTURE.md \
             docs/ERRORS.md docs/MIGRATION.md docs/PERFORMANCE.md \
             docs/SECURITY_MODEL.md docs/THIRD_PARTY.md \
@@ -221,6 +222,9 @@ jobs:
           grep -Fxq "校验和 = \"$checksum\"" 言序.toml
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             nm -gU "$ARTIFACT" | grep -F yanxu_native_module_v2
+            otool -D "$ARTIFACT" | tail -n +2 | \
+              grep -Fx '@rpath/libyanxu_gui_native.dylib'
+            codesign --verify --verbose=4 "$ARTIFACT"
           elif [[ "$RUNNER_OS" == "Windows" ]]; then
             vswhere=""
             for candidate in \
@@ -246,6 +250,11 @@ jobs:
             done
             test -x "$dumpbin"
             "$dumpbin" //exports "$ARTIFACT" | grep -F yanxu_native_module_v2
+            dependencies="$("$dumpbin" //dependents "$ARTIFACT")"
+            if printf '%s\n' "$dependencies" | grep -Eiq 'VCRUNTIME|MSVCP|UCRTBASE'; then
+              echo 'Windows 制品仍动态依赖 MSVC CRT'
+              exit 1
+            fi
           else
             nm -D "$ARTIFACT" | grep -F yanxu_native_module_v2
           fi

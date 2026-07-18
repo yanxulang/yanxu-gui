@@ -14,11 +14,14 @@
 不依赖当前目录：
 
 ```sh
-cargo fmt --manifest-path <仓库>/Cargo.toml --all -- --check
-cargo test --manifest-path <仓库>/Cargo.toml --workspace --locked
-cargo clippy --manifest-path <仓库>/Cargo.toml \
+cargo --config <仓库>/.cargo/config.toml fmt \
+  --manifest-path <仓库>/Cargo.toml --all -- --check
+cargo --config <仓库>/.cargo/config.toml test \
+  --manifest-path <仓库>/Cargo.toml --workspace --locked
+cargo --config <仓库>/.cargo/config.toml clippy --manifest-path <仓库>/Cargo.toml \
   --workspace --all-targets --all-features --locked -- -D warnings
-cargo build --manifest-path <仓库>/Cargo.toml --workspace --release --locked
+cargo --config <仓库>/.cargo/config.toml build \
+  --manifest-path <仓库>/Cargo.toml --workspace --release --locked
 <仓库>/scripts/prepare-current.sh <仓库>
 ```
 

@@ -87,6 +87,9 @@ x86_64-pc-windows-msvc       aarch64-pc-windows-msvc
 运行时不下载、编译或猜测其他平台的制品。目标不匹配、摘要或大小漂移、ABI 导出缺失都
 必须在装载或发布门禁中失败。
 
+`.cargo/config.toml`固定平台链接策略：macOS 使用可搬运的 `@rpath` 安装名，Windows
+静态链接 MSVC CRT。CI 必须对最终发布文件而非仅对 Cargo 中间产物验证这些属性。
+
 ## 变更规则
 
 - 公开方法与类型变更同时更新源码、JSON API、Markdown API、规格和迁移说明；

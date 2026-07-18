@@ -55,6 +55,10 @@ iOS、Android 和 32 位目标不属于 1.0.0 支持矩阵。
 也不从网络下载缺失文件。修改或重新编译动态库后必须重新生成清单和消费锁。发布标签中
 同一路径的制品不可静默替换。
 
+macOS 动态库使用 `@rpath/libyanxu_gui_native.dylib` 安装名，不嵌入构建机绝对路径；
+Windows 制品静态链接 MSVC CRT。Linux 制品只面向 GNU/glibc 目标，实际最低 glibc
+要求应由六目标发布门禁对最终制品复核。
+
 源码构建锁定 `eframe/egui 0.35.0`、`winit 0.30.13`、`arboard 3.6.1`、
 `image 0.25.10`、`rfd 0.17.2` 和 `sha2 0.10.9`。完整依赖与补丁说明见
 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)。
