@@ -571,7 +571,10 @@ unsafe fn resource_any<'a>(
         return Err("GUI_RESOURCE_CLOSED");
     }
     let resource = unsafe { &*raw.cast::<GuiResource>() };
-    if !kinds.contains(&resource.kind) || resource.cleaned.load(Ordering::Acquire) {
+    if resource.cleaned.load(Ordering::Acquire) {
+        return Err("GUI_RESOURCE_CLOSED");
+    }
+    if !kinds.contains(&resource.kind) {
         return Err("GUI_RESOURCE_TYPE");
     }
     if resource.host.0.event_loop_id != host.0.event_loop_id {
@@ -2803,6 +2806,18 @@ mod tests {
             model.node(app).expect("application remains live").children,
             [timer]
         );
+        drop(model);
+        resource.cleanup();
+        assert!(matches!(
+            unsafe {
+                call(
+                    Operation::GetProperty,
+                    &[Data::Resource(7), Data::String("已取消".into())],
+                    host,
+                )
+            },
+            Err("GUI_RESOURCE_CLOSED")
+        ));
     }
 
     #[test]
