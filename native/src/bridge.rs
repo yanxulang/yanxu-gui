@@ -3,11 +3,36 @@ use crate::model::Data;
 use std::collections::BTreeMap;
 use std::ptr;
 
+const MAX_VALUE_ELEMENTS: usize = 65_536;
+const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct DecodeBudget {
+    elements: usize,
+    bytes: usize,
+}
+
+impl DecodeBudget {
+    fn add_element(&mut self) -> Result<(), &'static str> {
+        self.elements = self.elements.checked_add(1).ok_or("GUI_VALUE_LIMIT")?;
+        (self.elements <= MAX_VALUE_ELEMENTS)
+            .then_some(())
+            .ok_or("GUI_VALUE_LIMIT")
+    }
+
+    fn add_bytes(&mut self, bytes: usize) -> Result<(), &'static str> {
+        self.bytes = self.bytes.checked_add(bytes).ok_or("GUI_VALUE_LIMIT")?;
+        (self.bytes <= MAX_TOTAL_BYTES)
+            .then_some(())
+            .ok_or("GUI_VALUE_LIMIT")
+    }
+}
+
 pub unsafe fn decode_arguments(
     arguments: *const Value,
     count: usize,
 ) -> Result<Vec<Data>, &'static str> {
-    if count > 65_536 || (count > 0 && arguments.is_null()) {
+    if count > MAX_VALUE_ELEMENTS || (count > 0 && arguments.is_null()) {
         return Err("GUI_VALUE_LIMIT");
     }
     let arguments = if count == 0 {
@@ -15,16 +40,22 @@ pub unsafe fn decode_arguments(
     } else {
         unsafe { std::slice::from_raw_parts(arguments, count) }
     };
+    let mut budget = DecodeBudget::default();
     arguments
         .iter()
-        .map(|value| unsafe { decode_value(value, 0) })
+        .map(|value| unsafe { decode_value(value, 0, &mut budget) })
         .collect()
 }
 
-unsafe fn decode_value(value: &Value, depth: usize) -> Result<Data, &'static str> {
+unsafe fn decode_value(
+    value: &Value,
+    depth: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Data, &'static str> {
     if depth > 64 {
         return Err("GUI_VALUE_LIMIT");
     }
+    budget.add_element()?;
     Ok(match value.kind {
         NULL => Data::Nil,
         BOOL => Data::Bool(value.flags & FLAG_TRUE != 0),
@@ -37,17 +68,17 @@ unsafe fn decode_value(value: &Value, depth: usize) -> Result<Data, &'static str
             Data::Number(number)
         }
         STRING => Data::String(
-            String::from_utf8(unsafe { copy_bytes(value, 4 * 1024 * 1024) }?)
+            String::from_utf8(unsafe { copy_bytes(value, 4 * 1024 * 1024, budget) }?)
                 .map_err(|_| "GUI_VALUE_UTF8")?,
         ),
-        BYTES => Data::Bytes(unsafe { copy_bytes(value, 16 * 1024 * 1024) }?),
+        BYTES => Data::Bytes(unsafe { copy_bytes(value, MAX_TOTAL_BYTES, budget) }?),
         ARRAY => {
             let count = usize::try_from(value.length).map_err(|_| "GUI_VALUE_LIMIT")?;
             let values = unsafe { value_slice(value.data.items, count) }?;
             Data::Array(
                 values
                     .iter()
-                    .map(|value| unsafe { decode_value(value, depth + 1) })
+                    .map(|value| unsafe { decode_value(value, depth + 1, budget) })
                     .collect::<Result<Vec<_>, _>>()?,
             )
         }
@@ -57,10 +88,11 @@ unsafe fn decode_value(value: &Value, depth: usize) -> Result<Data, &'static str
             let values = unsafe { value_slice(value.data.items, item_count) }?;
             let mut map = BTreeMap::new();
             for pair in values.chunks_exact(2) {
-                let Data::String(key) = (unsafe { decode_value(&pair[0], depth + 1) })? else {
+                let Data::String(key) = (unsafe { decode_value(&pair[0], depth + 1, budget) })?
+                else {
                     return Err("GUI_VALUE_TYPE");
                 };
-                let value = unsafe { decode_value(&pair[1], depth + 1) }?;
+                let value = unsafe { decode_value(&pair[1], depth + 1, budget) }?;
                 if map.insert(key, value).is_some() {
                     return Err("GUI_VALUE_TYPE");
                 }
@@ -75,11 +107,16 @@ unsafe fn decode_value(value: &Value, depth: usize) -> Result<Data, &'static str
     })
 }
 
-unsafe fn copy_bytes(value: &Value, limit: usize) -> Result<Vec<u8>, &'static str> {
+unsafe fn copy_bytes(
+    value: &Value,
+    limit: usize,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<u8>, &'static str> {
     let length = usize::try_from(value.length).map_err(|_| "GUI_VALUE_LIMIT")?;
     if length > limit {
         return Err("GUI_VALUE_LIMIT");
     }
+    budget.add_bytes(length)?;
     if length == 0 {
         return Ok(Vec::new());
     }
@@ -94,7 +131,7 @@ unsafe fn value_slice<'a>(
     pointer: *const Value,
     length: usize,
 ) -> Result<&'a [Value], &'static str> {
-    if length > 65_536 {
+    if length > MAX_VALUE_ELEMENTS {
         return Err("GUI_VALUE_LIMIT");
     }
     if length == 0 {
@@ -258,5 +295,42 @@ mod tests {
         assert_eq!(value.kind, NULL);
         assert_eq!(value.flags, 0);
         assert_eq!(value.length, 0);
+    }
+
+    #[test]
+    fn aggregate_element_limit_applies_across_nested_values() {
+        let children = vec![Value::default(); MAX_VALUE_ELEMENTS];
+        let root = Value {
+            kind: ARRAY,
+            length: children.len() as u64,
+            data: ValueData {
+                items: children.as_ptr(),
+            },
+            ..Value::default()
+        };
+
+        assert_eq!(
+            unsafe { decode_arguments(&raw const root, 1) },
+            Err("GUI_VALUE_LIMIT")
+        );
+    }
+
+    #[test]
+    fn aggregate_byte_limit_cannot_be_bypassed_with_multiple_values() {
+        let bytes = vec![0_u8; MAX_TOTAL_BYTES / 2 + 1];
+        let value = Value {
+            kind: BYTES,
+            length: bytes.len() as u64,
+            data: ValueData {
+                bytes: bytes.as_ptr(),
+            },
+            ..Value::default()
+        };
+        let arguments = [value, value];
+
+        assert_eq!(
+            unsafe { decode_arguments(arguments.as_ptr(), arguments.len()) },
+            Err("GUI_VALUE_LIMIT")
+        );
     }
 }
