@@ -1,19 +1,19 @@
 lock_version = 2
-manifest_checksum = "afac7a5c89f5fdcde85f244bf6afcfd86818805884e941899c9a8af7c1096ac3"
+manifest_checksum = "3b9bd9575de93c63177c00ad0e6b399a241d211e2876bc2cd70ef8654f60bce9"
 target = "aarch64-apple-darwin"
 generator = "1.1.12"
 
 [root_dependencies]
-"言窗" = "yanxu-gui@0.1.0#a5b4b144f221-ad1434486bc910d8"
+"言窗" = "yanxu-gui@1.0.0#a5b4b144f221-859af4ca606d0967"
 
 [root_dev_dependencies]
 
 [[package]]
-id = "yanxu-gui@0.1.0#a5b4b144f221-ad1434486bc910d8"
+id = "yanxu-gui@1.0.0#a5b4b144f221-859af4ca606d0967"
 name = "yanxu-gui"
-version = "0.1.0"
+version = "1.0.0"
 source = "path:.."
-checksum = "ad1434486bc910d827e349cfe90874341f4c5f2c6ffd57b91b7247fc61bc7e40"
+checksum = "859af4ca606d09677bd319af400733b00b257026ed99c39f4aa0f8bf6d11dc68"
 entry = "src/主.yx"
 target = "aarch64-apple-darwin"
 minimum_yanxu = ">=1.1.12"
@@ -27,5 +27,5 @@ minimum_yanxu = ">=1.1.12"
 abi = 2
 target = "aarch64-apple-darwin"
 path = "dist/aarch64-apple-darwin/libyanxu_gui_native.dylib"
-checksum = "92610835521ee3aa860eb9958b2e02fe265c5113facb231a7223ef1a6a6f688a"
-size = 9012864
+checksum = "b64cf8726ba1fd8290cdea6a7ac710cde72a338296561ed406eee5831a313f5f"
+size = 9012016
