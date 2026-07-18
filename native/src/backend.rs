@@ -1356,7 +1356,10 @@ impl eframe::App for DesktopApp {
             .filter(|node| matches!(node.kind, NodeKind::Window(_)) && node.common.visible)
             .map(|node| node.id)
             .collect::<Vec<_>>();
-        if self.root_window.is_none() {
+        if self
+            .root_window
+            .is_none_or(|root| !model.nodes.contains_key(&root))
+        {
             self.root_window = windows.first().copied();
         }
         if let Some(root) = self.root_window
@@ -1364,7 +1367,7 @@ impl eframe::App for DesktopApp {
         {
             self.apply_window_commands(&context, &model, root);
             self.collect_window_events(&context, &mut model, root);
-            self.handle_window_close(&context, &model, root);
+            self.handle_window_close(&context, &mut model, root);
             self.render_children(ui, &mut model, root);
         }
         for window_id in windows {
@@ -1393,7 +1396,7 @@ impl eframe::App for DesktopApp {
                 let viewport_context = ui.ctx().clone();
                 self.apply_window_commands(&viewport_context, &model, window_id);
                 self.collect_window_events(&viewport_context, &mut model, window_id);
-                self.handle_window_close(&viewport_context, &model, window_id);
+                self.handle_window_close(&viewport_context, &mut model, window_id);
                 self.render_children(ui, &mut model, window_id);
             });
         }
@@ -1527,18 +1530,17 @@ impl DesktopApp {
         }
     }
 
-    fn handle_window_close(&mut self, context: &egui::Context, model: &Model, id: u64) {
+    fn handle_window_close(&mut self, context: &egui::Context, model: &mut Model, id: u64) {
         if !context.input(|input| input.viewport().close_requested()) {
             return;
         }
-        if let Ok(node) = model.node(id)
-            && let Some(callback) = node.events.get("关闭")
-        {
-            self.pending.push(PendingEvent {
-                callback: *callback,
-                event: event_data("窗口关闭", node, None),
-            });
+        let (event, callbacks) = prepare_window_close(model, id);
+        if let Some(event) = event {
+            self.pending.push(event);
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        for callback in callbacks {
+            self.host.release(callback);
         }
     }
 
@@ -2185,6 +2187,22 @@ impl DesktopApp {
     }
 }
 
+fn prepare_window_close(model: &mut Model, id: u64) -> (Option<PendingEvent>, Vec<u64>) {
+    let Ok(node) = model.node(id) else {
+        return (None, Vec::new());
+    };
+    if let Some(callback) = node.events.get("关闭") {
+        return (
+            Some(PendingEvent {
+                callback: *callback,
+                event: event_data("窗口关闭", node, None),
+            }),
+            Vec::new(),
+        );
+    }
+    (None, model.remove(id))
+}
+
 fn pointer_event(context: &egui::Context) -> Option<Data> {
     context
         .input(|input| input.pointer.hover_pos())
@@ -2443,6 +2461,54 @@ mod tests {
             event_name(&Data::String("x".repeat(257))),
             Err("GUI_EVENT_NAME")
         );
+    }
+
+    #[test]
+    fn window_close_removes_unhandled_subtrees_but_defers_handled_windows() {
+        let mut model = Model::default();
+        let app = model
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create application");
+        let unhandled = model
+            .create(Some(app), NodeKind::Window(WindowState::default()))
+            .expect("create unhandled window");
+        let child = model
+            .create(
+                Some(unhandled),
+                NodeKind::Control(ControlState::new(ControlKind::Button)),
+            )
+            .expect("create child");
+        model
+            .bind_event(child, "点击".into(), 5)
+            .expect("bind child event");
+
+        let (event, callbacks) = prepare_window_close(&mut model, unhandled);
+        assert!(event.is_none());
+        assert_eq!(callbacks, [5]);
+        assert!(model.node(unhandled).is_err());
+        assert!(model.node(child).is_err());
+
+        let handled = model
+            .create(Some(app), NodeKind::Window(WindowState::default()))
+            .expect("create handled window");
+        model
+            .bind_event(handled, "关闭".into(), 7)
+            .expect("bind close event");
+        let (event, callbacks) = prepare_window_close(&mut model, handled);
+        let event = event.expect("handled close produces an event");
+        assert_eq!(event.callback, 7);
+        let Data::Map(data) = event.event else {
+            panic!("close event must be a map");
+        };
+        assert_eq!(data["类型"], Data::String("窗口关闭".into()));
+        assert!(callbacks.is_empty());
+        assert!(model.node(handled).is_ok());
     }
 
     #[test]
