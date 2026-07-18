@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TYPE_APP: &[u8] = b"yanxu.gui.application";
@@ -71,11 +71,7 @@ impl GuiResource {
         if self.cleaned.swap(true, Ordering::AcqRel) {
             return;
         }
-        let callbacks = self
-            .model
-            .lock()
-            .expect("GUI model poisoned")
-            .remove(self.id);
+        let callbacks = lock_model_for_cleanup(&self.model).remove(self.id);
         for callback in callbacks {
             self.host.release(callback);
         }
@@ -103,6 +99,17 @@ pub struct ResourceOutput {
 pub enum Output {
     Value(Data),
     Resource(ResourceOutput),
+}
+
+fn lock_model(model: &Mutex<Model>) -> Result<MutexGuard<'_, Model>, &'static str> {
+    model.lock().map_err(|_| "GUI_BACKEND_STATE")
+}
+
+fn lock_model_for_cleanup(model: &Mutex<Model>) -> MutexGuard<'_, Model> {
+    match model.lock() {
+        Ok(model) => model,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,7 +178,7 @@ pub unsafe fn call(
             require_count(arguments, 1)?;
             let title = text(&arguments[0])?.to_owned();
             let model = Arc::new(Mutex::new(Model::default()));
-            let id = model.lock().unwrap().create(
+            let id = lock_model(&model)?.create(
                 None,
                 NodeKind::Application {
                     title,
@@ -194,11 +201,8 @@ pub unsafe fn call(
             let config = map(&arguments[1])?;
             let mut window = WindowState::default();
             apply_window_config(&mut window, config)?;
-            let id = parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Window(window))?;
+            let id =
+                lock_model(&parent.model)?.create(Some(parent.id), NodeKind::Window(window))?;
             Ok(resource_output(
                 parent.model.clone(),
                 ResourceKind::Window,
@@ -221,11 +225,8 @@ pub unsafe fn call(
             let config = map(&arguments[2])?;
             let mut layout = LayoutState::new(kind);
             apply_layout_config(&mut layout, config)?;
-            let id = parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Layout(layout))?;
+            let id =
+                lock_model(&parent.model)?.create(Some(parent.id), NodeKind::Layout(layout))?;
             Ok(resource_output(
                 parent.model.clone(),
                 ResourceKind::Layout,
@@ -247,11 +248,8 @@ pub unsafe fn call(
             let config = map(&arguments[2])?;
             let mut control = create_control(text(&arguments[1])?, config)?;
             apply_control_config(&mut control, config)?;
-            let id = parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Control(control))?;
+            let id =
+                lock_model(&parent.model)?.create(Some(parent.id), NodeKind::Control(control))?;
             Ok(resource_output(
                 parent.model.clone(),
                 ResourceKind::Control,
@@ -313,12 +311,9 @@ pub unsafe fn call(
             let event = text(&arguments[1])?.to_owned();
             let callback = callback(&arguments[2])?;
             host.retain(callback)?;
-            match resource
-                .model
-                .lock()
-                .unwrap()
-                .bind_event(resource.id, event, callback)
-            {
+            let result = lock_model(&resource.model)
+                .and_then(|mut model| model.bind_event(resource.id, event, callback));
+            match result {
                 Ok(previous) => {
                     if let Some(previous) = previous {
                         host.release(previous);
@@ -344,10 +339,7 @@ pub unsafe fn call(
                     ],
                 )
             }?;
-            resource
-                .model
-                .lock()
-                .unwrap()
+            lock_model(&resource.model)?
                 .node_mut(resource.id)?
                 .common
                 .visible = matches!(operation, Operation::Show);
@@ -380,7 +372,7 @@ pub unsafe fn call(
         Operation::Exit => {
             require_count(arguments, 1)?;
             let (_, resource) = unsafe { resource(arguments, host, ResourceKind::Application) }?;
-            let mut model = resource.model.lock().unwrap();
+            let mut model = lock_model(&resource.model)?;
             model.exit_requested = true;
             model.repaint_requested = true;
             if let Some(wake) = host.0.wake {
@@ -406,12 +398,9 @@ pub unsafe fn call(
                 callback,
                 cancelled: false,
             };
-            let id = match parent
-                .model
-                .lock()
-                .unwrap()
-                .create(Some(parent.id), NodeKind::Timer(timer))
-            {
+            let result = lock_model(&parent.model)
+                .and_then(|mut model| model.create(Some(parent.id), NodeKind::Timer(timer)));
+            let id = match result {
                 Ok(id) => id,
                 Err(error) => {
                     host.release(callback);
@@ -434,7 +423,7 @@ pub unsafe fn call(
             if !matches!(theme, "亮色" | "暗色" | "系统") {
                 return Err("GUI_THEME");
             }
-            let mut model = resource.model.lock().unwrap();
+            let mut model = lock_model(&resource.model)?;
             let NodeKind::Application { theme: current, .. } =
                 &mut model.node_mut(resource.id)?.kind
             else {
@@ -479,7 +468,7 @@ pub unsafe fn call(
             require_count(arguments, 2)?;
             let (_, resource) = unsafe { resource(arguments, host, ResourceKind::Control) }?;
             let command = canvas_command(map(&arguments[1])?)?;
-            let mut model = resource.model.lock().unwrap();
+            let mut model = lock_model(&resource.model)?;
             let NodeKind::Control(control) = &mut model.node_mut(resource.id)?.kind else {
                 return Err("GUI_RESOURCE_TYPE");
             };
@@ -510,7 +499,7 @@ pub unsafe fn call(
                 )
             }?;
             let event = text(&arguments[1])?;
-            let node = resource.model.lock().unwrap().node(resource.id)?.clone();
+            let node = lock_model(&resource.model)?.node(resource.id)?.clone();
             if let Some(callback) = node.events.get(event) {
                 host.post(
                     *callback,
@@ -523,7 +512,7 @@ pub unsafe fn call(
         Operation::DebugSnapshot => {
             require_count(arguments, 1)?;
             let (_, resource) = unsafe { resource(arguments, host, ResourceKind::Application) }?;
-            let model = resource.model.lock().unwrap();
+            let model = lock_model(&resource.model)?;
             let mut result = BTreeMap::new();
             result.insert("资源总数".into(), Data::Integer(model.nodes.len() as i64));
             for (kind, count) in model.counts() {
@@ -583,11 +572,9 @@ unsafe fn resource_any<'a>(
     if resource.host.0.event_loop_id != host.0.event_loop_id {
         return Err("GUI_RESOURCE_LOOP");
     }
-    if let Ok(mut model) = resource.model.lock()
-        && let Ok(node) = model.node_mut(resource.id)
-    {
-        node.public_handle = *handle;
-    }
+    lock_model(&resource.model)?
+        .node_mut(resource.id)?
+        .public_handle = *handle;
     Ok((*handle, resource))
 }
 
@@ -800,7 +787,7 @@ fn apply_control_config(
 }
 
 fn set_property(resource: &GuiResource, key: &str, value: &Data) -> Result<(), &'static str> {
-    let mut model = resource.model.lock().unwrap();
+    let mut model = lock_model(&resource.model)?;
     let node = model.node_mut(resource.id)?;
     match key {
         "可见" => node.common.visible = value.as_bool().ok_or("GUI_VALUE_TYPE")?,
@@ -911,7 +898,7 @@ fn set_control_property(
 }
 
 fn get_property(resource: &GuiResource, key: &str) -> Result<Data, &'static str> {
-    let model = resource.model.lock().unwrap();
+    let model = lock_model(&resource.model)?;
     let node = model.node(resource.id)?;
     match key {
         "可见" => return Ok(Data::Bool(node.common.visible)),
@@ -1114,7 +1101,7 @@ fn run(model: Arc<Mutex<Model>>, host: HostApi) -> Result<(), &'static str> {
         return Err("GUI_PERMISSION");
     }
     let (title, viewport) = {
-        let model = model.lock().unwrap();
+        let model = lock_model(&model)?;
         let (title, window) = model
             .nodes
             .values()
@@ -1151,7 +1138,7 @@ fn run(model: Arc<Mutex<Model>>, host: HostApi) -> Result<(), &'static str> {
             }))
         }),
     );
-    let callbacks = run_model.lock().expect("GUI model poisoned").clear();
+    let callbacks = lock_model_for_cleanup(&run_model).clear();
     for callback in callbacks {
         host.release(callback);
     }
@@ -1180,7 +1167,10 @@ impl eframe::App for DesktopApp {
             self.fonts_loaded = true;
         }
         let model_shared = self.model.clone();
-        let mut model = model_shared.lock().unwrap();
+        let Ok(mut model) = lock_model(&model_shared) else {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        };
         let theme = model.nodes.values().find_map(|node| match &node.kind {
             NodeKind::Application { theme, .. } => Some(theme.as_str()),
             _ => None,
@@ -2205,6 +2195,59 @@ mod tests {
         }
         assert_eq!(event["目标"], Data::Integer(99));
         assert_eq!(event["横坐标"], Data::Number(12.5));
+    }
+
+    #[test]
+    fn poisoned_models_fail_calls_but_still_allow_idempotent_cleanup() {
+        let model = Arc::new(Mutex::new(Model::default()));
+        let id = model
+            .lock()
+            .expect("fresh model")
+            .create(
+                None,
+                NodeKind::Application {
+                    title: "测试".into(),
+                    theme: "系统".into(),
+                },
+            )
+            .expect("create application");
+        let poisoned = Arc::clone(&model);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.lock().expect("fresh model");
+            panic!("poison model for cleanup test");
+        }));
+        assert!(panic.is_err());
+
+        let resource = GuiResource {
+            model: Arc::clone(&model),
+            kind: ResourceKind::Application,
+            id,
+            host: HostApi(NativeHost {
+                abi_version: abi::ABI,
+                struct_size: std::mem::size_of::<NativeHost>(),
+                context: std::ptr::null_mut(),
+                callback_retain: None,
+                callback_release: None,
+                callback_post: None,
+                wake: None,
+                pump: None,
+                has_permission: None,
+                resource_get: None,
+                event_loop_id: 1,
+                owner_thread_token: 1,
+            }),
+            cleaned: AtomicBool::new(false),
+        };
+
+        assert_eq!(
+            set_property(&resource, "名称", &Data::String("新名称".into())),
+            Err("GUI_BACKEND_STATE")
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| resource.cleanup())).is_ok()
+        );
+        assert!(lock_model_for_cleanup(&model).node(id).is_err());
+        resource.cleanup();
     }
 
     #[test]
