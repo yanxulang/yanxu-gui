@@ -42,6 +42,9 @@ file="$root/dist/$target/$(basename -- "$source")"
 temporary="$file.tmp.$$"
 trap 'rm -f "$temporary"' EXIT HUP INT TERM
 cp "$source" "$temporary"
+if test "$os" = macos; then
+  codesign --force --sign - --identifier dev.yanxu.gui.native --timestamp=none "$temporary"
+fi
 chmod a-w "$temporary"
 mv -f "$temporary" "$file"
 trap - EXIT HUP INT TERM
