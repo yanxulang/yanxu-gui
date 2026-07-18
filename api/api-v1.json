@@ -1,6 +1,21 @@
 {
   "declarations": [
     {
+      "async": false,
+      "documentation": "",
+      "kind": "function",
+      "name": "错误详情",
+      "parameters": [
+        {
+          "name": "所误",
+          "type": "误"
+        }
+      ],
+      "result": "典",
+      "signature": "法（误）：典",
+      "static": false
+    },
+    {
       "documentation": "",
       "fields": [
         {
