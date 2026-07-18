@@ -666,6 +666,16 @@
           "async": false,
           "documentation": "",
           "kind": "method",
+          "name": "关闭",
+          "parameters": [],
+          "result": "任意",
+          "signature": "法（）：任意",
+          "static": false
+        },
+        {
+          "async": false,
+          "documentation": "",
+          "kind": "method",
           "name": "文字",
           "parameters": [
             {
